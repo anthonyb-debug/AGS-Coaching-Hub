@@ -2563,14 +2563,29 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     },
     onCred: function (resp) {
       var tok = resp && resp.credential; if (!tok) return;
-      var p = decodeJwt(tok); S.token = tok; S.tokenExp = (p.exp || 0) * 1000; S.picture = /^https:\/\/[^\s"'<>]+$/.test(p.picture || '') ? p.picture : '';
+      applyToken(tok); saveToken(tok);
       var w = Auth.waiters; Auth.waiters = []; w.forEach(function (x) { x.res(tok); });
       var m = $('#reauth-box'); if (m) closeModal(true);
       if (!S.user) startServer('http');
     },
     button: function (el) { google.accounts.id.renderButton(el, { theme: 'outline', size: 'large', text: 'signin_with', shape: 'rectangular', width: 280 }); },
-    signOut: function () { try { google.accounts.id.disableAutoSelect(); } catch (e) { } S.token = null; S.tokenExp = 0; S.picture = ''; }
+    signOut: function () { try { google.accounts.id.disableAutoSelect(); } catch (e) { } S.token = null; S.tokenExp = 0; S.picture = ''; clearToken(); }
   };
+  var TOKEN_KEY = 'ags_idt';
+  var SS = (function () { try { var k = '__ags_s'; sessionStorage.setItem(k, '1'); sessionStorage.removeItem(k); return sessionStorage; } catch (e) { return null; } })();
+  function applyToken(tok) {
+    var p = decodeJwt(tok); S.token = tok; S.tokenExp = (p.exp || 0) * 1000;
+    S.picture = /^https:\/\/[^\s"'<>]+$/.test(p.picture || '') ? p.picture : '';
+  }
+  function saveToken(tok) { if (SS) { try { SS.setItem(TOKEN_KEY, tok); } catch (e) { } } }
+  function clearToken() { if (SS) { try { SS.removeItem(TOKEN_KEY); } catch (e) { } } }
+  // Returns true if a still-valid sign-in from this tab was restored.
+  function restoreToken() {
+    var tok = SS ? SS.getItem(TOKEN_KEY) : null; if (!tok) return false;
+    var p = decodeJwt(tok);
+    if (!p.exp || p.exp * 1000 - Date.now() < 120000) { clearToken(); return false; }
+    applyToken(tok); return true;
+  }
   function getToken() { if (S.token && S.tokenExp - Date.now() > 90000) return Promise.resolve(S.token); return reauth(); }
   function reauth() {
     return new Promise(function (res, rej) {
@@ -4074,6 +4089,11 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   window.addEventListener('beforeunload', function (e) { var m = topModal(); if (m && m._form && m._form.dirty) { e.preventDefault(); e.returnValue = ''; } });
   function boot() {
     if (window.google && google.script && google.script.run) { startServer('gas'); return; }
+    if (CFG.API_URL && CFG.GOOGLE_CLIENT_ID && restoreToken()) {
+      startServer('http');                       // refresh keeps you signed in for this tab
+      Auth.load().catch(function () { });        // ready for re-sign-in when the token expires
+      return;
+    }
     renderLogin();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
