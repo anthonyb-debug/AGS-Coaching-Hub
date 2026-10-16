@@ -303,6 +303,10 @@ table.t .group-h th{background:var(--surface);border-bottom:0;font-size:11.5px;c
 .steps button.has-err::after{content:"needs attention";margin-left:auto;font-size:10.5px;color:var(--bad);font-weight:600}
 .fsec{display:none} .fsec.on{display:block}
 .fsec h3{margin-bottom:4px} .fsec .sec-intro{color:var(--muted);font-size:13px;margin-bottom:14px}
+.csec{border-top:1px solid var(--line-2);padding-top:16px;margin-top:18px}
+.csec:first-of-type{border-top:0;padding-top:0;margin-top:4px}
+.csec > h3{margin-bottom:12px}
+.item-row.simple{grid-template-columns:minmax(0,1fr) 160px 140px auto}
 .items-list{display:flex;flex-direction:column;gap:8px}
 .item-row{display:grid;grid-template-columns:minmax(0,2.4fr) minmax(0,1fr) 150px 140px auto;gap:8px;align-items:start;border:1px solid var(--line-2);border-radius:var(--radius-m);padding:8px;background:var(--surface-2)}
 .calc{display:flex;gap:10px;flex-wrap:wrap;align-items:center;background:var(--surface-2);border:1px dashed var(--line);border-radius:var(--radius-m);padding:9px 12px;font-size:13px}
@@ -747,7 +751,7 @@ var AGSCore = (function () {
   // ------------------------------------------------------------------
   function validatePlan(plan, items, sess, errors, strict) {
     if (strict) {
-      requireFields(errors, plan, ['ExpectedImprovement', 'FollowUpDate', 'ResponsibleTeamLeadID', 'TargetDirection'], 'plan.');
+      requireFields(errors, plan, ['FollowUpDate', 'ResponsibleTeamLeadID', 'TargetDirection'], 'plan.');
       var active = (items || []).filter(function (i) { return i.Status !== 'Cancelled'; });
       if (!active.length) errors.items = 'Add at least one action item.';
     }
@@ -767,10 +771,15 @@ var AGSCore = (function () {
   }
   function validateSession(sess, plan, items, today, errors) {
     var st = sess.Status || 'Draft';
-    var req = ['AgentID', 'CampaignID', 'CoachingDate', 'Category', 'Title'];
-    if (st === 'Scheduled' || st === 'Completed') req = req.concat(['TeamLeadID', 'Priority', 'SourceOfConcern', 'GapDescription']);
-    if (st === 'Completed') req = req.concat(['ExpectedStandard', 'ActualPerformance', 'DiscussionSummary', 'GuidanceProvided', 'CoachingMethod']);
+    var req = ['AgentID', 'CampaignID', 'CoachingDate', 'Category'];
+    if (st === 'Scheduled' || st === 'Completed') req = req.concat(['TeamLeadID', 'Priority', 'SourceOfConcern']);
+    if (st === 'Completed') req = req.concat(['DiscussionSummary', 'CoachingMethod']);
     requireFields(errors, sess, req, 'coaching.');
+    // The gap must be measurable: a KPI result, or an observed behaviour against an expected standard.
+    if (st === 'Completed' && sess.GapType !== 'Numeric') {
+      requireFields(errors, sess, ['ActualPerformance'], 'coaching.', 'Describe what you observed.');
+      requireFields(errors, sess, ['ExpectedStandard'], 'coaching.', 'Describe what is expected.');
+    }
     var rc = arr(sess.RootCauses);
     rc.forEach(function (r) { if (ROOT_CAUSES.indexOf(r) < 0) errors['coaching.RootCauses'] = 'Invalid root-cause selection.'; });
     if (rc.indexOf('Other') >= 0 && !s(sess.RootCauseNotes)) errors['coaching.RootCauseNotes'] = 'Explain the "Other" root cause.';
@@ -791,7 +800,9 @@ var AGSCore = (function () {
   function docMissing(sess, plan, items, settings) {
     if (!sess || sess.Status !== 'Completed') return null;
     var miss = [];
-    ['GapDescription', 'ExpectedStandard', 'ActualPerformance', 'DiscussionSummary', 'GuidanceProvided', 'CoachingMethod'].forEach(function (f) { if (!s(sess[f]).trim()) miss.push(f); });
+    ['DiscussionSummary', 'CoachingMethod'].forEach(function (f) { if (!s(sess[f]).trim()) miss.push(f); });
+    if (sess.GapType === 'Numeric') { if (n(sess.ActualValue) === null) miss.push('ActualValue'); }
+    else { if (!s(sess.ActualPerformance).trim()) miss.push('ActualPerformance'); if (!s(sess.ExpectedStandard).trim()) miss.push('ExpectedStandard'); }
     if (!arr(sess.RootCauses).length) miss.push('RootCauses');
     s((settings || {}).DocumentationExtraFields).split(',').map(function (x) { return x.trim(); }).filter(Boolean).forEach(function (f) {
       if (SCHEMA.CoachingSessions.indexOf(f) >= 0 && !s(sess[f]).trim()) miss.push(f);
@@ -800,7 +811,6 @@ var AGSCore = (function () {
     if (!plan) miss.push('ActionPlan');
     else {
       if (!plan.FollowUpDate) miss.push('FollowUpDate');
-      if (!s(plan.ExpectedImprovement)) miss.push('ExpectedImprovement');
       if (!(items || []).some(function (i) { return i.Status !== 'Cancelled' && s(i.Description); })) miss.push('ActionItems');
     }
     return miss;
@@ -1318,6 +1328,12 @@ var AGSCore = (function () {
     if (se.RelatedKPIID) { var k = ctx.find('kpis', se.RelatedKPIID); if (!k || k.ArchivedAt || k.CampaignID !== se.CampaignID) errors['coaching.RelatedKPIID'] = 'Select a KPI configured for this campaign.'; }
     return { agent: agent, camp: camp };
   }
+  function autoTitle(se, kpi) { return s(se.Category) + ' coaching' + (kpi ? ' — ' + kpi.Name : ''); }
+  function targetText(plan, kpi) {
+    var u = kpi && kpi.Unit ? (kpi.Unit === '%' ? '%' : ' ' + kpi.Unit) : '';
+    if (plan.TargetDirection === 'Within Range') return s(plan.TargetMin) + '–' + s(plan.TargetMax) + u;
+    return (plan.TargetDirection === 'Lower Is Better' ? '≤ ' : '≥ ') + s(plan.TargetValue) + u;
+  }
   function preparePlan(ctx, input, se, existing, errors) {
     var p = sanitize('plans', input || {}, errors, 'plan.');
     if (p.Status && (!existing || p.Status !== existing.Status) && ['Not Started', 'In Progress', 'Pending Follow-up'].indexOf(p.Status) < 0) {
@@ -1332,11 +1348,25 @@ var AGSCore = (function () {
     if (merged.TargetKPIID) {
       var k = ctx.find('kpis', merged.TargetKPIID);
       if (!k || k.ArchivedAt || k.CampaignID !== se.CampaignID) errors['plan.TargetKPIID'] = 'Select a KPI configured for this campaign.';
-      else if (!merged.TargetDirection) merged.TargetDirection = k.TargetDirection;
+      else {
+        if (!merged.TargetDirection) merged.TargetDirection = k.TargetDirection;
+        if (merged.TargetDirection === 'Within Range') {
+          if (n(merged.TargetMin) === null) merged.TargetMin = s(k.TargetMin);
+          if (n(merged.TargetMax) === null) merged.TargetMax = s(k.TargetMax);
+        } else if (n(merged.TargetValue) === null && n(k.TargetValue) !== null) merged.TargetValue = s(k.TargetValue);
+      }
+    }
+    if (!merged.TargetDirection && !merged.TargetKPIID) merged.TargetDirection = 'Qualitative Evaluation';
+    if (!merged.MonitoringEnd && merged.FollowUpDate) merged.MonitoringEnd = merged.FollowUpDate;
+    if (!s(merged.ExpectedImprovement).trim()) {
+      var kp = merged.TargetKPIID ? ctx.find('kpis', merged.TargetKPIID) : null;
+      merged.ExpectedImprovement = kp && merged.TargetDirection !== 'Qualitative Evaluation'
+        ? 'Reach ' + targetText(merged, kp) + ' on ' + kp.Name + ' by the follow-up.'
+        : 'Consistently meet the expected standard' + (se.ExpectedStandard ? ': ' + s(se.ExpectedStandard).slice(0, 300) : '') + '.';
     }
     if (!s(merged.BaselineValue) && n(se.ActualValue) !== null) merged.BaselineValue = s(se.ActualValue);
     if (!merged.MonitoringStart && se.CoachingDate) merged.MonitoringStart = se.CoachingDate;
-    ['ResponsibleTeamLeadID', 'TargetDirection', 'BaselineValue', 'MonitoringStart', 'Status'].forEach(function (f) { if (!existing || merged[f] !== existing[f]) p[f] = merged[f]; });
+    ['ResponsibleTeamLeadID', 'TargetDirection', 'BaselineValue', 'MonitoringStart', 'Status', 'MonitoringEnd', 'ExpectedImprovement', 'TargetValue', 'TargetMin', 'TargetMax'].forEach(function (f) { if (!existing || merged[f] !== existing[f]) p[f] = merged[f]; });
     return { fields: p, merged: merged };
   }
   function prepareItems(ctx, inputs, plan, errors) {
@@ -1395,6 +1425,7 @@ var AGSCore = (function () {
     }
     if (!c.Status) c.Status = 'Draft';
     if (!c.GapType) c.GapType = 'Descriptive';
+    if (!c.Title) c.Title = autoTitle(c, c.RelatedKPIID ? ctx.find('kpis', c.RelatedKPIID) : null);
     var refs = checkRefs(ctx, c, errors, true);
     if (refs.agent && refs.agent.Status === 'Inactive') errors['coaching.AgentID'] = 'This agent is inactive.';
     if (refs.camp && refs.camp.Status === 'Inactive') errors['coaching.CampaignID'] = 'This campaign is inactive.';
@@ -1423,6 +1454,9 @@ var AGSCore = (function () {
     if (cur.Status === 'Cancelled' && c.Status && c.Status !== 'Cancelled' && !isOM(u)) forbid('Only an Operations Manager can reopen a cancelled coaching record.');
     if (cur.Status === 'Completed' && (c.Status === 'Draft' || c.Status === 'Scheduled') && !isOM(u)) errors['coaching.Status'] = 'A completed session cannot return to Draft or Scheduled.';
     var m = Object.assign({}, cur, c);
+    if (!('Title' in (p.coaching || {})) && (!cur.Title || (c.Category && c.Category !== cur.Category) || ('RelatedKPIID' in c && c.RelatedKPIID !== cur.RelatedKPIID))) {
+      c.Title = m.Title = autoTitle(m, m.RelatedKPIID ? ctx.find('kpis', m.RelatedKPIID) : null);
+    }
     checkRefs(ctx, m, errors, (c.Category && c.Category !== cur.Category) || (c.CampaignID && c.CampaignID !== cur.CampaignID));
     var kids = children(ctx, cur.CoachingID), planPrep = null, itemPrep = [];
     if (p.actionPlan) {
@@ -2952,13 +2986,13 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       (miss && miss.length ? '<div class="note warn" style="margin-bottom:12px">Documentation standard not met. Missing: ' + esc(miss.join(', ')) + '.</div>' : '') +
       '<h3>Basic information</h3><dl class="dl" style="margin-top:8px">' + dd('Agent', '<a href="#/agents/' + esc(s.AgentID) + '" data-act="goAgent" data-id="' + esc(s.AgentID) + '">' + esc(agName(s.AgentID)) + '</a>') + dd('Campaign', esc(campName(s.CampaignID))) +
       dd('Team lead', esc(tlName(s.TeamLeadID))) + dd('Coaching date', esc(fmtDate(s.CoachingDate))) + dd('Category', txt(s.Category)) + dd('Source of concern', txt(s.SourceOfConcern)) +
-      dd('Related KPI', kpi ? esc(kpi.Name + ' — target ' + kpiTargetText(kpi)) : '') + dd('Gap description', txt(s.GapDescription), true) + '</dl>' +
+      dd('Related KPI', kpi ? esc(kpi.Name + ' — target ' + kpiTargetText(kpi)) : '') + (s.GapDescription ? dd('Gap description', txt(s.GapDescription), true) : '') + '</dl>' +
       '<div class="sec"><h3>Performance gap</h3><dl class="dl">' + dd('Gap type', txt(s.GapType)) + dd('Expected standard', txt(s.ExpectedStandard)) + dd('Actual performance', txt(s.ActualPerformance)) +
       (s.GapType === 'Numeric' ? dd('Expected value', esc(fmtNum(s.ExpectedValue, kpi && kpi.Unit))) + dd('Actual value', esc(fmtNum(s.ActualValue, kpi && kpi.Unit))) : '') +
       dd('Performance gap', txt(s.PerformanceGap)) + dd('Observed period', txt(s.ObservedPeriod)) + dd('Supporting evidence', txt(s.SupportingEvidence), true) + '</dl></div>' +
       '<div class="sec"><h3>Root cause (team lead assessment)</h3><div class="row">' + (C.arr(s.RootCauses).map(function (r) { return '<span class="b plain">' + esc(r) + '</span>'; }).join('') || '<span class="muted">Not recorded</span>') + '</div>' + (s.RootCauseNotes ? '<p>' + esc(s.RootCauseNotes) + '</p>' : '') + '</div>' +
       '<div class="sec"><h3>Coaching discussion</h3><dl class="dl">' + dd('Coaching method', txt(s.CoachingMethod)) + dd('Acknowledgment', C.b(s.AcknowledgmentRequired) ? (C.b(s.AgentAcknowledged) ? 'Acknowledged ' + esc(fmtDate(s.AcknowledgedAt)) : '<span class="b warn">Required, not yet acknowledged</span>') : 'Not required') +
-      dd('Discussion summary', txt(s.DiscussionSummary), true) + dd('Guidance provided', txt(s.GuidanceProvided), true) + dd('Agent feedback', txt(s.AgentFeedback), true) + dd('Supporting notes', txt(s.SupportingNotes), true) +
+      dd('Discussion summary', txt(s.DiscussionSummary), true) + (s.GuidanceProvided ? dd('Guidance provided', txt(s.GuidanceProvided), true) : '') + dd('Agent feedback', txt(s.AgentFeedback), true) + dd('Supporting notes', txt(s.SupportingNotes), true) +
       (s.Status === 'Cancelled' ? dd('Cancellation reason', txt(s.CancelReason), true) : '') + '</dl></div>';
     if (plan) {
       var pk = S.idx.kpis[plan.TargetKPIID], target = plan.TargetDirection === 'Within Range' ? plan.TargetMin + '–' + plan.TargetMax : plan.TargetValue;
@@ -3101,229 +3135,298 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     return shown > 0 || rest.length > 0;
   }
 
-  // ---------------- coaching form ----------------
-  var SECTIONS = [['A', 'Basic information'], ['B', 'Performance gap'], ['C', 'Root cause'], ['D', 'Coaching discussion'], ['E', 'Action plan'], ['F', 'Status and review']];
-  var FIELD_SECTION = { AgentID: 0, CampaignID: 0, TeamLeadID: 0, CoachingDate: 0, Category: 0, Priority: 0, SourceOfConcern: 0, RelatedKPIID: 0, Title: 0, GapDescription: 0,
-    GapType: 1, ExpectedStandard: 1, ActualPerformance: 1, ExpectedValue: 1, ActualValue: 1, PerformanceGap: 1, SupportingEvidence: 1, ObservedPeriod: 1, RootCauses: 2, RootCauseNotes: 2,
-    DiscussionSummary: 3, GuidanceProvided: 3, CoachingMethod: 3, AgentFeedback: 3, AcknowledgmentRequired: 3, AgentAcknowledged: 3, AcknowledgedAt: 3, SupportingNotes: 3, Status: 5, CancelReason: 5 };
+  // ---------------- coaching form (single page, simplified and measurable) ----------------
   var LVL = { draft: 0, scheduled: 1, completed: 2 }, STATUS_LVL = { Draft: 0, Cancelled: 0, Scheduled: 1, Completed: 2 };
   function fld(o) {
     var id = 'fld-' + o.f.replace('.', '-'), v = o.value === undefined || o.value === null ? '' : o.value, a = ' id="' + id + '" data-f="' + o.f + '" class="input"' + (o.attrs || '') + (o.hint ? ' aria-describedby="' + id + '-h"' : '');
-    var input = o.type === 'textarea' ? '<textarea' + a + ' maxlength="' + (o.max || 4000) + '">' + esc(v) + '</textarea>'
+    var input = o.type === 'textarea' ? '<textarea' + a + ' maxlength="' + (o.max || 4000) + '"' + (o.rows ? ' style="min-height:' + o.rows * 24 + 'px"' : '') + (o.ph ? ' placeholder="' + esc(o.ph) + '"' : '') + '>' + esc(v) + '</textarea>'
       : o.type === 'select' ? '<select' + a + '>' + o.options + '</select>'
-      : '<input' + a + ' type="' + (o.type || 'text') + '" value="' + esc(v) + '"' + (o.type === 'number' ? ' step="any"' : '') + (o.max ? ' maxlength="' + o.max + '"' : '') + '>';
+      : '<input' + a + ' type="' + (o.type || 'text') + '" value="' + esc(v) + '"' + (o.type === 'number' ? ' step="any" inputmode="decimal"' : '') + (o.max ? ' maxlength="' + o.max + '"' : '') + (o.ph ? ' placeholder="' + esc(o.ph) + '"' : '') + '>';
     return '<div class="' + (o.span || '') + '"' + (o.wrapId ? ' id="' + o.wrapId + '"' : '') + (o.hidden ? ' hidden' : '') + '><label class="lbl" data-lvl="' + (o.lvl || '') + '" for="' + id + '">' + esc(o.label) + '</label>' + input + (o.hint ? '<div class="hint" id="' + id + '-h">' + o.hint + '</div>' : '') + '<div class="err" id="' + id + '-e" hidden></div></div>';
   }
   function itemRow(it, i) {
     it = it || {}; var locked = it.Status === 'Cancelled' && it.ActionItemID;
-    return '<div class="item-row" data-id="' + esc(it.ActionItemID || '') + '" data-v="' + esc(it.RecordVersion || '') + '">' +
-      '<div><label class="sr-only" for="it-d-' + i + '">Action item description</label><input id="it-d-' + i + '" class="input" data-i="Description" placeholder="Agreed action" maxlength="1000" value="' + esc(it.Description || '') + '"' + (locked ? ' disabled' : '') + '><div class="err" data-ierr="Description" hidden></div></div>' +
-      '<div><label class="sr-only" for="it-o-' + i + '">Owner</label><input id="it-o-' + i + '" class="input" data-i="Owner" placeholder="Owner" maxlength="100" value="' + esc(it.Owner || '') + '"></div>' +
-      '<div><label class="sr-only" for="it-dl-' + i + '">Deadline</label><input id="it-dl-' + i + '" type="date" class="input" data-i="Deadline" value="' + esc(it.Deadline || '') + '"><div class="err" data-ierr="Deadline" hidden></div></div>' +
+    return '<div class="item-row simple" data-id="' + esc(it.ActionItemID || '') + '" data-v="' + esc(it.RecordVersion || '') + '">' +
+      '<div><label class="sr-only" for="it-d-' + i + '">Action</label><input id="it-d-' + i + '" class="input" data-i="Description" placeholder="What will the agent do?" maxlength="1000" value="' + esc(it.Description || '') + '"' + (locked ? ' disabled' : '') + '><div class="err" data-ierr="Description" hidden></div></div>' +
+      '<div><label class="sr-only" for="it-dl-' + i + '">Deadline</label><input id="it-dl-' + i + '" type="date" class="input" data-i="Deadline" title="Deadline (optional)" value="' + esc(it.Deadline || '') + '"><div class="err" data-ierr="Deadline" hidden></div></div>' +
       '<div><label class="sr-only" for="it-s-' + i + '">Status</label><select id="it-s-' + i + '" class="input" data-i="Status">' + opts(C.ITEM_STATUSES, it.Status || 'Not Started') + '</select></div>' +
-      '<button class="btn btn-sm btn-ghost" data-act="removeItem" aria-label="Remove action item">' + (it.ActionItemID ? 'Cancel item' : 'Remove') + '</button></div>';
+      '<button class="btn btn-sm btn-ghost" data-act="removeItem" aria-label="Remove action">' + (it.ActionItemID ? 'Cancel' : 'Remove') + '</button></div>';
+  }
+  function campKpis(cid) { return S.data.kpis.filter(function (k) { return C.live(k) && k.CampaignID === cid && C.b(k.Active); }); }
+  function unitSfx(k) { return k && k.Unit ? (k.Unit === '%' ? '%' : ' ' + k.Unit) : ''; }
+  // Describes how far a KPI result is from its target, in the KPI's own direction.
+  function gapInfo(k, actual, tv, tmin, tmax) {
+    var a = C.n(actual); if (!k || a === null) return null;
+    var u = unitSfx(k), dir = k.TargetDirection, r = function (x) { return Math.round(x * 100) / 100; };
+    if (dir === 'Within Range') {
+      var lo = C.n(tmin), hi = C.n(tmax); if (lo === null || hi === null) return null;
+      if (a < lo) return { met: false, text: r(lo - a) + u + ' below the target range' };
+      if (a > hi) return { met: false, text: r(a - hi) + u + ' above the target range' };
+      return { met: true, text: 'Within the target range' };
+    }
+    var t = C.n(tv); if (t === null || dir === 'Qualitative Evaluation') return null;
+    var short = dir === 'Higher Is Better' ? t - a : a - t;
+    return short > 0 ? { met: false, text: r(short) + u + (dir === 'Higher Is Better' ? ' below' : ' above') + ' target' } : { met: true, text: 'Already meets the target' };
   }
   function draftKey(id) { return 'ags_draft_' + S.mode + '_' + S.user.email + '_' + (id || 'new'); }
   ACT.newCoaching = function (el) { openCoachingForm(null, { templateId: el && el.dataset.template, agentId: el && el.dataset.agent }); };
   ACT.editCoaching = function (el) { closeAllModals(); openCoachingForm(el.dataset.id); };
+
   function openCoachingForm(id, o) {
     o = o || {};
     var s = id ? C.clone(findSession(id)) : null, k = id ? sessionKids(id) : { plan: null, items: [] };
     if (id && !s) { toast('Record not found.', 'bad'); return; }
-    var u = me(), om = isOM();
+    var om = isOM();
     if (!s) {
-      var agent0 = o.agentId ? ag(o.agentId) : null;
-      s = C.blank('sessions'); s.Status = 'Completed'; s.CoachingDate = S.today; s.GapType = 'Descriptive'; s.Priority = 'Medium';
-      s.CampaignID = agent0 && agent0.CampaignID ? agent0.CampaignID : S.g.campaignId; s.AgentID = agent0 ? agent0.AgentID : '';
-      s.TeamLeadID = om ? (agent0 ? agent0.TeamLeadID : '') : S.user.teamLeadId;
+      var a0 = o.agentId ? ag(o.agentId) : null;
+      s = C.blank('sessions'); s.Status = 'Completed'; s.CoachingDate = S.today; s.Priority = 'Medium';
+      s.CampaignID = a0 && a0.CampaignID ? a0.CampaignID : S.g.campaignId; s.AgentID = a0 ? a0.AgentID : '';
+      s.TeamLeadID = om ? (a0 ? a0.TeamLeadID : '') : S.user.teamLeadId;
     }
-    var plan = k.plan ? C.clone(k.plan) : { FollowUpDate: id ? '' : C.addDays(S.today, 14), MonitoringStart: '', MonitoringEnd: id ? '' : C.addDays(S.today, 28), Status: 'Not Started', TargetDirection: '' };
-    var items = k.items.length ? k.items : (id ? [] : [{}]);
+    var plan = k.plan ? C.clone(k.plan) : { FollowUpDate: C.addDays(s.CoachingDate || S.today, 14) };
+    var items = k.items.length ? k.items : [{}];
+    var mode = s.GapType === 'Numeric' ? 'kpi' : (id ? 'obs' : (campKpis(s.CampaignID).length ? 'kpi' : 'obs'));
+    var kpi0 = S.idx.kpis[s.RelatedKPIID] || null;
+    var tv = plan.TargetValue || (kpi0 ? kpi0.TargetValue : ''), tmin = plan.TargetMin || (kpi0 ? kpi0.TargetMin : ''), tmax = plan.TargetMax || (kpi0 ? kpi0.TargetMax : '');
+    var rc = C.arr(s.RootCauses), templates = S.data.templates.filter(function (t) { return C.live(t) && C.b(t.Active); });
+    var statusList = id ? [['Completed', 'Completed'], ['Scheduled', 'Scheduled for later'], ['Draft', 'Draft'], ['Cancelled', 'Cancelled']] : [['Completed', 'Completed (it happened)'], ['Scheduled', 'Scheduled for later']];
     var planClosed = k.plan && !C.isOpenPlan(k.plan.Status);
-    var templates = S.data.templates.filter(function (t) { return C.live(t) && C.b(t.Active); });
-    var rc = C.arr(s.RootCauses);
-    var sec = [];
-    sec[0] = (!id ? '<div class="note" style="margin-bottom:14px"><label class="lbl" for="tpl-pick">Start from a template (optional)</label><div class="row"><select id="tpl-pick" class="input" style="max-width:420px">' + opts(templates.map(function (t) { return [t.TemplateID, t.Name + ' — ' + campName(t.CampaignID)]; }), o.templateId || '', 'No template') + '</select><button class="btn btn-sm" data-act="applyTemplate">Apply</button></div><div class="hint">Templates fill empty fields only; nothing you typed is overwritten.</div></div>' : '') +
-      '<div class="fgrid">' + fld({ f: 'coaching.CampaignID', label: 'Campaign', type: 'select', lvl: 'draft', options: campOpts(s.CampaignID, 'Select campaign', true) }) +
+
+    var body = '<div id="cf-top"></div>' +
+      (!id && templates.length ? '<div class="row" style="margin-bottom:16px"><label class="small muted" for="tpl-pick">Start from a template</label><select id="tpl-pick" class="input input-sm" style="max-width:340px">' + opts(templates.map(function (t) { return [t.TemplateID, t.Name + ' (' + campName(t.CampaignID) + ')']; }), o.templateId || '', 'None') + '</select><button class="btn btn-sm" data-act="applyTemplate">Apply</button></div>' : '') +
+      '<section class="csec"><h3>1. Who and when</h3><div class="fgrid three">' +
+      fld({ f: 'coaching.CampaignID', label: 'Campaign', type: 'select', lvl: 'draft', options: campOpts(s.CampaignID, 'Select campaign', true) }) +
       fld({ f: 'coaching.AgentID', label: 'Agent', type: 'select', lvl: 'draft', options: agentOpts(s.CampaignID, s.AgentID, 'Select agent', true) }) +
-      fld({ f: 'coaching.TeamLeadID', label: 'Team lead', type: 'select', lvl: 'scheduled', options: tlOpts(s.TeamLeadID, 'Select team lead'), attrs: om ? '' : ' disabled', hint: om ? '' : 'Records you create are assigned to you.' }) +
-      fld({ f: 'coaching.CoachingDate', label: 'Coaching date', type: 'date', lvl: 'draft', value: s.CoachingDate }) +
-      fld({ f: 'coaching.Category', label: 'Coaching category', type: 'select', lvl: 'draft', options: opts(campCats(s.CampaignID).concat(s.Category && campCats(s.CampaignID).indexOf(s.Category) < 0 ? [s.Category] : []), s.Category, 'Select category') }) +
+      fld({ f: 'coaching.TeamLeadID', label: 'Team lead', type: 'select', lvl: 'scheduled', options: tlOpts(s.TeamLeadID, 'Select team lead'), attrs: om ? '' : ' disabled' }) +
+      fld({ f: 'coaching.CoachingDate', label: 'Date', type: 'date', lvl: 'draft', value: s.CoachingDate }) +
+      fld({ f: 'coaching.Category', label: 'Category', type: 'select', lvl: 'draft', options: opts(campCats(s.CampaignID).concat(s.Category && campCats(s.CampaignID).indexOf(s.Category) < 0 ? [s.Category] : []), s.Category, 'Select category') }) +
+      fld({ f: 'coaching.Status', label: 'Session', type: 'select', options: opts(statusList, s.Status) }) +
       fld({ f: 'coaching.Priority', label: 'Priority', type: 'select', lvl: 'scheduled', options: opts(C.PRIORITIES, s.Priority, 'Select') }) +
-      fld({ f: 'coaching.SourceOfConcern', label: 'Source of concern', type: 'select', lvl: 'scheduled', options: opts(C.SOURCES, s.SourceOfConcern, 'Select') }) +
-      fld({ f: 'coaching.RelatedKPIID', label: 'Related KPI (optional)', type: 'select', options: kpiOpts(s.CampaignID, s.RelatedKPIID, 'None — descriptive coaching'), hint: '<span id="kpi-hint"></span>' }) +
-      fld({ f: 'coaching.Title', label: 'Coaching title', lvl: 'draft', value: s.Title, max: 150, span: 'span2' }) +
-      fld({ f: 'coaching.GapDescription', label: 'Description of the performance gap', type: 'textarea', lvl: 'scheduled', value: s.GapDescription, span: 'span2' }) + '</div>';
-    sec[1] = '<fieldset style="border:0;padding:0;margin:0 0 14px"><legend class="lbl">Gap type</legend><div class="radio-row">' + C.GAP_TYPES.map(function (g) { return '<label class="radio-pill"><input type="radio" name="gaptype" value="' + g + '"' + (s.GapType === g ? ' checked' : '') + ' data-change="gapType"> ' + (g === 'Numeric' ? 'Numeric (measured KPI)' : 'Descriptive (behaviour or process)') + '</label>'; }).join('') + '</div></fieldset>' +
-      '<div class="fgrid">' + fld({ f: 'coaching.ExpectedStandard', label: 'Expected standard', type: 'textarea', lvl: 'completed', value: s.ExpectedStandard, max: 1000 }) +
-      fld({ f: 'coaching.ActualPerformance', label: 'Actual performance', type: 'textarea', lvl: 'completed', value: s.ActualPerformance, max: 1000 }) +
-      fld({ f: 'coaching.ExpectedValue', label: 'Expected value', type: 'number', value: s.ExpectedValue, wrapId: 'w-exp', hidden: s.GapType !== 'Numeric', lvl: 'scheduled' }) +
-      fld({ f: 'coaching.ActualValue', label: 'Actual value', type: 'number', value: s.ActualValue, wrapId: 'w-act', hidden: s.GapType !== 'Numeric', lvl: 'scheduled' }) +
-      fld({ f: 'coaching.PerformanceGap', label: 'Performance gap', value: s.PerformanceGap, max: 500, hint: 'Calculated for numeric gaps; you can edit it.' }) +
-      fld({ f: 'coaching.ObservedPeriod', label: 'Date or period of observed issue', value: s.ObservedPeriod, max: 200 }) +
-      fld({ f: 'coaching.SupportingEvidence', label: 'Supporting evidence', type: 'textarea', value: s.SupportingEvidence, span: 'span2', hint: 'Reference QA forms, reports or call IDs rather than pasting personal data.' }) + '</div>';
-    sec[2] = '<p class="sec-intro">Select the causes you assessed. These record your judgment; the system does not infer causes.</p><fieldset style="border:0;padding:0;margin:0"><legend class="lbl" data-lvl="completed">Root-cause categories</legend><div class="checks">' +
+      fld({ f: 'coaching.SourceOfConcern', label: 'How the issue was found', type: 'select', lvl: 'scheduled', options: opts(C.SOURCES, s.SourceOfConcern, 'Select') }) +
+      fld({ f: 'coaching.CancelReason', label: 'Cancellation reason', value: s.CancelReason, max: 500, wrapId: 'w-cancel', hidden: s.Status !== 'Cancelled' }) +
+      '</div></section>' +
+
+      '<section class="csec"><h3>2. Performance gap</h3><div class="radio-row" role="radiogroup" aria-label="How is the gap measured?">' +
+      '<label class="radio-pill"><input type="radio" name="gapmode" value="kpi"' + (mode === 'kpi' ? ' checked' : '') + '> Measured by a KPI</label>' +
+      '<label class="radio-pill"><input type="radio" name="gapmode" value="obs"' + (mode === 'obs' ? ' checked' : '') + '> Observed behaviour</label></div>' +
+      '<div id="g-kpi" class="fgrid three" style="margin-top:12px"' + (mode === 'kpi' ? '' : ' hidden') + '>' +
+      fld({ f: 'coaching.RelatedKPIID', label: 'KPI', type: 'select', lvl: 'scheduled', options: kpiOpts(s.CampaignID, s.RelatedKPIID, 'Select KPI'), hint: '<span id="kpi-none"></span>' }) +
+      fld({ f: 'coaching.ActualValue', label: 'Current result', type: 'number', lvl: 'scheduled', value: s.ActualValue, hint: '<span id="unit-hint"></span>' }) +
+      '<div><span class="lbl">Gap to target</span><div class="calc" id="g-calc" aria-live="polite" style="min-height:34px"></div></div></div>' +
+      '<div id="g-obs" class="fgrid" style="margin-top:12px"' + (mode === 'obs' ? '' : ' hidden') + '>' +
+      fld({ f: 'coaching.ActualPerformance', label: 'What did you observe?', type: 'textarea', lvl: 'completed', rows: 3, max: 1000, value: s.GapType === 'Numeric' ? '' : s.ActualPerformance, ph: 'e.g. Late to log in 3 times this week' }) +
+      fld({ f: 'coaching.ExpectedStandard', label: 'What is expected?', type: 'textarea', lvl: 'completed', rows: 3, max: 1000, value: s.GapType === 'Numeric' ? '' : s.ExpectedStandard, ph: 'e.g. Logged in and ready at shift start' }) + '</div>' +
+      '<div style="margin-top:12px">' + fld({ f: 'coaching.SupportingEvidence', label: 'Evidence reference (optional)', value: s.SupportingEvidence, max: 4000, ph: 'QA form, report or call ID' }) + '</div></section>' +
+
+      '<section class="csec"><h3>3. Root cause</h3><fieldset style="border:0;padding:0;margin:0"><legend class="lbl" data-lvl="completed">Your assessment of why it happened</legend><div class="checks">' +
       C.ROOT_CAUSES.map(function (r, i) { return '<label class="check"><input type="checkbox" name="rc" value="' + esc(r) + '" id="rc-' + i + '"' + (rc.indexOf(r) >= 0 ? ' checked' : '') + '> ' + esc(r) + '</label>'; }).join('') +
-      '</div><div class="err" id="fld-coaching-RootCauses-e" hidden></div></fieldset><div style="margin-top:14px">' + fld({ f: 'coaching.RootCauseNotes', label: 'Explanatory notes', type: 'textarea', value: s.RootCauseNotes, max: 2000 }) + '</div>';
-    sec[3] = '<p class="sec-intro" id="prompts-hint"></p><div class="fgrid">' + fld({ f: 'coaching.DiscussionSummary', label: 'Discussion summary', type: 'textarea', lvl: 'completed', value: s.DiscussionSummary, max: 6000, span: 'span2' }) +
-      fld({ f: 'coaching.GuidanceProvided', label: 'Guidance provided', type: 'textarea', lvl: 'completed', value: s.GuidanceProvided }) + fld({ f: 'coaching.AgentFeedback', label: 'Agent feedback', type: 'textarea', value: s.AgentFeedback }) +
+      '</div><div class="err" id="fld-coaching-RootCauses-e" hidden></div></fieldset><div style="margin-top:10px">' + fld({ f: 'coaching.RootCauseNotes', label: 'Notes (needed if you choose Other)', value: s.RootCauseNotes, max: 2000 }) + '</div></section>' +
+
+      '<section class="csec"><h3>4. Coaching discussion</h3><p class="sec-intro" id="prompts-hint" hidden></p><div class="fgrid">' +
+      fld({ f: 'coaching.DiscussionSummary', label: 'What was discussed and agreed', type: 'textarea', lvl: 'completed', rows: 3, max: 6000, value: s.DiscussionSummary, span: 'span2' }) +
       fld({ f: 'coaching.CoachingMethod', label: 'Coaching method', type: 'select', lvl: 'completed', options: opts(C.METHODS, s.CoachingMethod, 'Select method') }) +
-      '<div><span class="lbl">Agent acknowledgment</span><label class="check"><input type="checkbox" data-f="coaching.AcknowledgmentRequired"' + (C.b(s.AcknowledgmentRequired) ? ' checked' : '') + '> Acknowledgment required</label><label class="check"><input type="checkbox" data-f="coaching.AgentAcknowledged"' + (C.b(s.AgentAcknowledged) ? ' checked' : '') + '> Agent has acknowledged</label></div>' +
-      fld({ f: 'coaching.AcknowledgedAt', label: 'Acknowledged on', type: 'date', value: s.AcknowledgedAt }) +
-      fld({ f: 'coaching.SupportingNotes', label: 'Supporting notes', type: 'textarea', value: s.SupportingNotes }) + '</div>';
-    sec[4] = '<div class="err" id="fld-plan-e" hidden></div><div class="fgrid">' + fld({ f: 'plan.ExpectedImprovement', label: 'Expected improvement', type: 'textarea', lvl: 'completed', value: plan.ExpectedImprovement, max: 2000, span: 'span2' }) +
-      '<div class="span2"><span class="lbl" data-lvl="completed">Agreed action items</span><div class="items-list" id="items">' + items.map(itemRow).join('') + '</div><div class="err" id="fld-items-e" hidden></div><button class="btn btn-sm" style="margin-top:8px" data-act="addItemRow">Add action item</button></div>' +
-      fld({ f: 'plan.SupportRequired', label: 'Support required', type: 'textarea', value: plan.SupportRequired, max: 2000, span: 'span2' }) +
-      fld({ f: 'plan.MonitoringStart', label: 'Monitoring start', type: 'date', value: plan.MonitoringStart, hint: 'Defaults to the coaching date.' }) + fld({ f: 'plan.MonitoringEnd', label: 'Monitoring end', type: 'date', value: plan.MonitoringEnd }) +
-      fld({ f: 'plan.TargetKPIID', label: 'Target KPI', type: 'select', options: kpiOpts(s.CampaignID, plan.TargetKPIID || s.RelatedKPIID, 'None') }) +
-      fld({ f: 'plan.TargetDirection', label: 'Target direction', type: 'select', lvl: 'completed', options: opts(C.DIRECTIONS, plan.TargetDirection, 'Select') }) +
-      fld({ f: 'plan.TargetValue', label: 'Target value', type: 'number', value: plan.TargetValue, wrapId: 'w-tv' }) + fld({ f: 'plan.BaselineValue', label: 'Baseline value', type: 'number', value: plan.BaselineValue, hint: 'Defaults to the actual value in section B.' }) +
-      fld({ f: 'plan.TargetMin', label: 'Target minimum', type: 'number', value: plan.TargetMin, wrapId: 'w-tmin' }) + fld({ f: 'plan.TargetMax', label: 'Target maximum', type: 'number', value: plan.TargetMax, wrapId: 'w-tmax' }) +
-      fld({ f: 'plan.FollowUpDate', label: 'Follow-up date', type: 'date', lvl: 'completed', value: plan.FollowUpDate }) +
-      fld({ f: 'plan.ResponsibleTeamLeadID', label: 'Responsible team lead', type: 'select', lvl: 'completed', options: tlOpts(plan.ResponsibleTeamLeadID || s.TeamLeadID, 'Same as coaching team lead'), attrs: om ? '' : ' disabled' }) + '</div>';
-    sec[5] = '<div class="fgrid">' + fld({ f: 'coaching.Status', label: 'Coaching status', type: 'select', lvl: 'draft', options: opts(C.COACHING_STATUSES, s.Status), hint: 'Completing a session does not resolve the performance issue; that is decided at follow-up.' }) +
-      (planClosed ? '<div><span class="lbl">Action plan status</span><p>' + sb(k.plan.Status) + '</p><div class="hint">Change closed plans from the record view.</div></div>'
-        : fld({ f: 'plan.Status', label: 'Action plan status', type: 'select', options: opts(['Not Started', 'In Progress', 'Pending Follow-up'], plan.Status || 'Not Started') })) +
-      fld({ f: 'coaching.CancelReason', label: 'Cancellation reason', type: 'textarea', value: s.CancelReason, max: 500, span: 'span2', wrapId: 'w-cancel', hidden: s.Status !== 'Cancelled' }) +
-      '</div><div class="note" style="margin-top:14px" id="review-summary">Required fields depend on the status. Draft needs only the basics; Completed needs the full documentation and an action plan.</div>';
-    var body = '<div id="cf-top"></div><div class="form-layout"><ol class="steps" aria-label="Form sections">' + SECTIONS.map(function (x, i) { return '<li><button data-act="step" data-i="' + i + '"' + (i === 0 ? ' aria-current="step"' : '') + '>' + esc(x[1]) + '</button></li>'; }).join('') + '</ol><div>' +
-      SECTIONS.map(function (x, i) { return '<section class="fsec' + (i === 0 ? ' on' : '') + '" data-sec="' + i + '" aria-label="' + esc(x[1]) + '"><h3>' + esc(x[1]) + '</h3><div style="height:10px"></div>' + sec[i] + '</section>'; }).join('') + '</div></div>';
-    var foot = '<span class="left" id="cf-draft-state">' + (id ? 'Editing version ' + esc(s.RecordVersion) + '.' : 'Not saved yet.') + '</span><button class="btn" data-act="stepPrev">Back</button><button class="btn" data-act="stepNext">Next</button><button class="btn btn-primary" id="cf-save">' + (id ? 'Save changes' : 'Save coaching record') + '</button>';
-    var F = { id: id, base: s, plan: k.plan, dirty: false, step: 0 };
-    var m = openModal({ title: id ? 'Edit ' + esc(id) : 'New coaching record', sub: id ? esc(agName(s.AgentID)) : 'Sections A to F', body: body, foot: foot, size: 'xl', sticky: true,
-      onClose: function () { if (F.dirty && !window.confirm('Discard unsaved changes? A local draft is kept in this browser until you discard it.')) return false; } });
+      fld({ f: 'coaching.AgentFeedback', label: 'Agent\'s response (optional)', value: s.AgentFeedback, max: 4000 }) +
+      '<div class="span2"><label class="check"><input type="checkbox" data-f="coaching.AgentAcknowledged"' + (C.b(s.AgentAcknowledged) ? ' checked' : '') + '> The agent acknowledged this coaching</label></div></div></section>' +
+
+      '<section class="csec"><h3>5. Action plan and follow-up</h3><div class="err" id="fld-plan-e" hidden></div>' +
+      (planClosed ? '<div class="note" style="margin-bottom:10px">This plan is ' + esc(k.plan.Status) + '. Reopen it from the record view to change its status.</div>' : '') +
+      '<span class="lbl" data-lvl="completed">Actions the agent will take</span><div class="items-list" id="items">' + items.map(itemRow).join('') + '</div><div class="err" id="fld-items-e" hidden></div>' +
+      '<button class="btn btn-sm" style="margin-top:8px" data-act="addItemRow">Add another action</button>' +
+      '<div class="fgrid three" style="margin-top:14px">' +
+      fld({ f: 'plan.TargetValue', label: 'Target at follow-up', type: 'number', value: tv, wrapId: 'w-tv', hint: '<span id="tv-hint">Taken from the KPI; change it if you agreed a step target.</span>' }) +
+      fld({ f: 'plan.TargetMin', label: 'Target range minimum', type: 'number', value: tmin, wrapId: 'w-tmin' }) +
+      fld({ f: 'plan.TargetMax', label: 'Target range maximum', type: 'number', value: tmax, wrapId: 'w-tmax' }) +
+      fld({ f: 'plan.FollowUpDate', label: 'Follow-up date', type: 'date', lvl: 'completed', value: plan.FollowUpDate, hint: 'A follow-up is scheduled automatically.' }) +
+      fld({ f: 'plan.SupportRequired', label: 'Support needed (optional)', value: plan.SupportRequired, max: 2000, span: 'span2' }) + '</div></section>';
+
+    var foot = '<span class="left" id="cf-draft-state">' + (id ? 'Editing version ' + esc(s.RecordVersion) + '.' : 'Not saved yet.') + '</span>' +
+      (!id || s.Status === 'Draft' ? '<button class="btn" id="cf-draft">Save as draft</button>' : '') +
+      '<button class="btn btn-primary" id="cf-save">' + (id ? 'Save changes' : 'Save coaching') + '</button>';
+    var F = { id: id, base: s, plan: k.plan, dirty: false };
+    var m = openModal({ title: id ? 'Edit ' + esc(id) : 'New coaching', sub: id ? esc(agName(s.AgentID)) : 'Fields marked * are required to save as completed', body: body, foot: foot, size: 'lg', sticky: true,
+      onClose: function () { if (F.dirty && !window.confirm('Discard unsaved changes? A local draft stays in this browser until you discard it.')) return false; } });
     m._form = F;
     var dk = draftKey(id), draft = lsGet(dk, null);
-    if (draft && (!id || !s.UpdatedAt || draft.savedAt > s.UpdatedAt)) {
+    if (draft && draft.v === 2 && (!id || !s.UpdatedAt || draft.savedAt > s.UpdatedAt)) {
       $('#cf-top', m).innerHTML = '<div class="note warn" style="margin-bottom:12px">A local draft from ' + esc(fmtTs(draft.savedAt)) + ' exists in this browser. It has <strong>not</strong> been saved to the server. <button class="btn btn-sm" data-act="restoreDraft">Restore draft</button> <button class="btn btn-sm btn-ghost" data-act="discardDraft">Discard draft</button></div>';
     }
     wireForm(m);
     if (o.templateId) applyTemplate(m, o.templateId);
-    m.querySelector('#cf-save').onclick = function () { submitCoaching(m); };
+    $('#cf-save', m).onclick = function () { submitCoaching(m, false); };
+    var dr = $('#cf-draft', m); if (dr) dr.onclick = function () { submitCoaching(m, true); };
   }
-  function formEls(m) { return { camp: $('#fld-coaching-CampaignID', m), agent: $('#fld-coaching-AgentID', m), tl: $('#fld-coaching-TeamLeadID', m), cat: $('#fld-coaching-Category', m), kpi: $('#fld-coaching-RelatedKPIID', m), pkpi: $('#fld-plan-TargetKPIID', m), dir: $('#fld-plan-TargetDirection', m), status: $('#fld-coaching-Status', m) }; }
+
+  function fv(m, f) { var el = $('[data-f="' + f + '"]', m); return el ? (el.type === 'checkbox' ? el.checked : el.value) : ''; }
+  function gapMode(m) { return ($('input[name=gapmode]:checked', m) || {}).value || 'obs'; }
+  function clearFieldErr(t) {
+    var wrap = t.closest('.item-row > div') || t.closest('fieldset') || (t.closest('.fgrid > div, .csec > div') || {});
+    if (!wrap.querySelector) return;
+    var e = wrap.querySelector('.err:not([hidden])'); if (e) { e.hidden = true; e.textContent = ''; }
+    if (t.removeAttribute) t.removeAttribute('aria-invalid');
+    if (t.name === 'rc') { var r = document.getElementById('fld-coaching-RootCauses-e'); if (r) r.hidden = true; }
+    if (t.closest('#items')) { var ie = document.getElementById('fld-items-e'); if (ie) ie.hidden = true; }
+  }
   function wireForm(m) {
-    var F = m._form, e = formEls(m);
-    var saveDraft = debounce(function () { if (!document.contains(m)) return; lsSet(draftKey(F.id), { savedAt: new Date().toISOString(), data: collectForm(m) }); var st = $('#cf-draft-state', m); if (st) st.textContent = 'Local draft saved in this browser (not on the server).'; }, 800);
-    m.addEventListener('input', function (ev) { if (ev.target.closest('.modal-b')) { F.dirty = true; saveDraft(); } if (ev.target.matches('#fld-coaching-ExpectedValue,#fld-coaching-ActualValue')) calcGap(m); });
-    m.addEventListener('change', function (ev) { if (ev.target.closest('.modal-b')) { F.dirty = true; saveDraft(); } });
-    e.camp.addEventListener('change', function () {
-      var c = e.camp.value; e.agent.innerHTML = agentOpts(c, '', 'Select agent', true); e.cat.innerHTML = opts(campCats(c), '', 'Select category');
-      e.kpi.innerHTML = kpiOpts(c, '', 'None — descriptive coaching'); e.pkpi.innerHTML = kpiOpts(c, '', 'None'); kpiHint(m);
+    var F = m._form;
+    var saveDraft = debounce(function () { if (!document.contains(m)) return; lsSet(draftKey(F.id), { v: 2, savedAt: new Date().toISOString(), data: snapshot(m) }); var st = $('#cf-draft-state', m); if (st) st.textContent = 'Local draft kept in this browser (not on the server).'; }, 800);
+    m.addEventListener('input', function (ev) { if (ev.target.closest('.modal-b')) { F.dirty = true; saveDraft(); clearFieldErr(ev.target); } if (ev.target.matches('#fld-coaching-ActualValue,#fld-plan-TargetValue,#fld-plan-TargetMin,#fld-plan-TargetMax')) gapUI(m); });
+    m.addEventListener('change', function (ev) {
+      if (!ev.target.closest('.modal-b')) return;
+      F.dirty = true; saveDraft();
+      var t = ev.target; clearFieldErr(t);
+      if (t.name === 'gapmode') { F.modeTouched = true; modeUI(m); }
+      else if (t.id === 'fld-coaching-CampaignID') campaignChanged(m);
+      else if (t.id === 'fld-coaching-AgentID') { var a = ag(t.value), tl = $('#fld-coaching-TeamLeadID', m); if (isOM() && a.TeamLeadID && !tl.value) tl.value = a.TeamLeadID; }
+      else if (t.id === 'fld-coaching-RelatedKPIID') kpiChanged(m);
+      else if (t.id === 'fld-coaching-Status') { reqUI(m); $('#w-cancel', m).hidden = t.value !== 'Cancelled'; }
+      else if (t.id === 'fld-coaching-CoachingDate' && !F.id) { var fu = $('#fld-plan-FollowUpDate', m); if (!fu.dataset.touched && C.isIsoDate(t.value)) fu.value = C.addDays(t.value, 14); }
+      else if (t.id === 'fld-plan-FollowUpDate') t.dataset.touched = '1';
     });
-    e.agent.addEventListener('change', function () { var a = ag(e.agent.value); if (isOM() && a.TeamLeadID && !e.tl.value) e.tl.value = a.TeamLeadID; });
-    e.kpi.addEventListener('change', function () {
-      var kp = S.idx.kpis[e.kpi.value]; kpiHint(m);
-      if (kp) {
-        if (kp.TargetDirection !== 'Qualitative Evaluation') { var r = $('input[name=gaptype][value=Numeric]', m); r.checked = true; gapTypeUI(m); }
-        var ev2 = $('#fld-coaching-ExpectedValue', m); if (!ev2.value && kp.TargetValue) ev2.value = kp.TargetValue;
-        if (!e.pkpi.value) { e.pkpi.value = kp.KPIID; applyKpiToPlan(m, kp); }
-      }
-    });
-    e.pkpi.addEventListener('change', function () { var kp = S.idx.kpis[e.pkpi.value]; if (kp) applyKpiToPlan(m, kp, true); });
-    e.dir.addEventListener('change', function () { dirUI(m); });
-    e.status.addEventListener('change', function () { reqUI(m); $('#w-cancel', m).hidden = e.status.value !== 'Cancelled'; });
-    $('#fld-coaching-CoachingDate', m).addEventListener('change', function () { var ms = $('#fld-plan-MonitoringStart', m); if (!F.id && !ms.value) ms.placeholder = this.value; });
-    kpiHint(m); dirUI(m); reqUI(m); calcGap(m);
+    modeUI(m); reqUI(m);
   }
-  function applyKpiToPlan(m, kp, force) {
-    var d = $('#fld-plan-TargetDirection', m); if (force || !d.value) d.value = kp.TargetDirection;
-    [['TargetValue', kp.TargetValue], ['TargetMin', kp.TargetMin], ['TargetMax', kp.TargetMax]].forEach(function (x) { var el = $('#fld-plan-' + x[0], m); if (force || !el.value) el.value = x[1] || ''; });
-    dirUI(m);
+  function campaignChanged(m) {
+    var c = fv(m, 'coaching.CampaignID');
+    $('#fld-coaching-AgentID', m).innerHTML = agentOpts(c, '', 'Select agent', true);
+    $('#fld-coaching-Category', m).innerHTML = opts(campCats(c), '', 'Select category');
+    $('#fld-coaching-RelatedKPIID', m).innerHTML = kpiOpts(c, '', 'Select KPI');
+    if (!campKpis(c).length && gapMode(m) === 'kpi') { $('input[name=gapmode][value=obs]', m).checked = true; }
+    else if (campKpis(c).length && !m._form.modeTouched && !m._form.id) { $('input[name=gapmode][value=kpi]', m).checked = true; }
+    kpiChanged(m); modeUI(m);
   }
-  function kpiHint(m) { var kp = S.idx.kpis[$('#fld-coaching-RelatedKPIID', m).value], h = $('#kpi-hint', m); if (h) h.textContent = kp ? 'Configured target: ' + kpiTargetText(kp) + (kp.Description ? '. ' + kp.Description : '') : ''; }
-  function gapTypeUI(m) { var num = ($('input[name=gaptype]:checked', m) || {}).value === 'Numeric'; $('#w-exp', m).hidden = !num; $('#w-act', m).hidden = !num; calcGap(m); }
-  CHG.gapType = function (el) { gapTypeUI(el.closest('.modal')); };
-  function dirUI(m) { var d = $('#fld-plan-TargetDirection', m).value; $('#w-tv', m).hidden = !(d === 'Higher Is Better' || d === 'Lower Is Better'); $('#w-tmin', m).hidden = $('#w-tmax', m).hidden = d !== 'Within Range'; }
-  function reqUI(m) { var lv = STATUS_LVL[$('#fld-coaching-Status', m).value] || 0; $$('[data-lvl]', m).forEach(function (l) { var x = l.dataset.lvl; l.classList.toggle('req', x !== '' && LVL[x] <= lv); }); }
-  function calcGap(m) {
-    var num = ($('input[name=gaptype]:checked', m) || {}).value === 'Numeric', a = C.n($('#fld-coaching-ExpectedValue', m).value), b = C.n($('#fld-coaching-ActualValue', m).value), g = $('#fld-coaching-PerformanceGap', m);
-    if (num && a !== null && b !== null && (!g.value || g.dataset.auto === '1')) { var kp = S.idx.kpis[$('#fld-coaching-RelatedKPIID', m).value]; g.value = String(Math.round(Math.abs(a - b) * 100) / 100) + (kp ? ' ' + kp.Unit : ''); g.dataset.auto = '1'; }
+  function kpiChanged(m) {
+    var k = S.idx.kpis[fv(m, 'coaching.RelatedKPIID')];
+    $('#fld-plan-TargetValue', m).value = k && k.TargetDirection !== 'Within Range' ? (k.TargetValue || '') : '';
+    $('#fld-plan-TargetMin', m).value = k ? (k.TargetMin || '') : ''; $('#fld-plan-TargetMax', m).value = k ? (k.TargetMax || '') : '';
+    modeUI(m);
   }
-  function collectForm(m) {
-    var c = {}, p = {};
-    $$('[data-f]', m).forEach(function (el) { var parts = el.dataset.f.split('.'), v = el.type === 'checkbox' ? el.checked : el.value; (parts[0] === 'coaching' ? c : p)[parts[1]] = v; });
-    c.RootCauses = $$('input[name=rc]:checked', m).map(function (x) { return x.value; });
-    c.GapType = ($('input[name=gaptype]:checked', m) || {}).value || 'Descriptive';
-    var items = $$('.item-row', m).map(function (r) { var o = { ActionItemID: r.dataset.id || '', RecordVersion: r.dataset.v || '' }; $$('[data-i]', r).forEach(function (x) { o[x.dataset.i] = x.value; }); return o; });
-    return { c: c, p: p, items: items };
+  function modeUI(m) {
+    var kpiMode = gapMode(m) === 'kpi', c = fv(m, 'coaching.CampaignID'), k = S.idx.kpis[fv(m, 'coaching.RelatedKPIID')];
+    $('#g-kpi', m).hidden = !kpiMode; $('#g-obs', m).hidden = kpiMode;
+    var none = $('#kpi-none', m); none.textContent = kpiMode && c && !campKpis(c).length ? 'No KPIs are set up for this campaign yet. Use "Observed behaviour", or ask an Operations Manager to add one.' : (k ? 'Target ' + kpiTargetText(k) + ', ' + k.TargetDirection.toLowerCase() + '.' : '');
+    $('#unit-hint', m).textContent = k ? 'In ' + k.Unit + '.' : '';
+    var range = kpiMode && k && k.TargetDirection === 'Within Range', single = kpiMode && k && (k.TargetDirection === 'Higher Is Better' || k.TargetDirection === 'Lower Is Better');
+    $('#w-tv', m).hidden = !single; $('#w-tmin', m).hidden = !range; $('#w-tmax', m).hidden = !range;
+    gapUI(m);
   }
-  function fillForm(m, d) {
-    Object.keys(d.c).forEach(function (k) { var el = $('[data-f="coaching.' + k + '"]', m); if (!el) return; if (el.type === 'checkbox') el.checked = !!d.c[k]; else { if (k === 'CampaignID') { el.value = d.c[k]; el.dispatchEvent(new Event('change', { bubbles: true })); } else el.value = d.c[k]; } });
-    Object.keys(d.p).forEach(function (k) { var el = $('[data-f="plan.' + k + '"]', m); if (el) el.value = d.p[k]; });
-    $$('input[name=rc]', m).forEach(function (x) { x.checked = (d.c.RootCauses || []).indexOf(x.value) >= 0; });
-    var g = $('input[name=gaptype][value="' + d.c.GapType + '"]', m); if (g) g.checked = true;
+  function gapUI(m) {
+    var box = $('#g-calc', m), k = S.idx.kpis[fv(m, 'coaching.RelatedKPIID')];
+    if (!k) { box.innerHTML = '<span class="muted">Choose a KPI.</span>'; return; }
+    var g = gapInfo(k, fv(m, 'coaching.ActualValue'), fv(m, 'plan.TargetValue'), fv(m, 'plan.TargetMin'), fv(m, 'plan.TargetMax'));
+    box.innerHTML = g ? (g.met ? sb('Met') : sb('Not Met')) + ' <span>' + esc(g.text) + '</span>' : '<span class="muted">Enter the current result.</span>';
+  }
+  function reqUI(m) { var lv = STATUS_LVL[fv(m, 'coaching.Status')] || 0; $$('[data-lvl]', m).forEach(function (l) { var x = l.dataset.lvl; l.classList.toggle('req', x !== '' && LVL[x] <= lv); }); }
+
+  function snapshot(m) {
+    var f = {}; $$('[data-f]', m).forEach(function (el) { f[el.dataset.f] = el.type === 'checkbox' ? el.checked : el.value; });
+    return { f: f, rc: $$('input[name=rc]:checked', m).map(function (x) { return x.value; }), mode: gapMode(m),
+      items: $$('.item-row', m).map(function (r) { var o = { ActionItemID: r.dataset.id || '', RecordVersion: r.dataset.v || '' }; $$('[data-i]', r).forEach(function (x) { o[x.dataset.i] = x.value; }); return o; }) };
+  }
+  function restoreSnapshot(m, d) {
+    var camp = $('#fld-coaching-CampaignID', m); camp.value = d.f['coaching.CampaignID'] || ''; campaignChanged(m);
+    $('input[name=gapmode][value="' + d.mode + '"]', m).checked = true;
+    Object.keys(d.f).forEach(function (k) { if (k === 'coaching.CampaignID') return; var el = $('[data-f="' + k + '"]', m); if (!el || el.disabled) return; if (el.type === 'checkbox') el.checked = !!d.f[k]; else el.value = d.f[k]; });
+    $$('input[name=rc]', m).forEach(function (x) { x.checked = d.rc.indexOf(x.value) >= 0; });
     $('#items', m).innerHTML = (d.items.length ? d.items : [{}]).map(itemRow).join('');
-    gapTypeUI(m); dirUI(m); reqUI(m); $('#w-cancel', m).hidden = $('#fld-coaching-Status', m).value !== 'Cancelled';
+    modeUI(m); reqUI(m); $('#w-cancel', m).hidden = fv(m, 'coaching.Status') !== 'Cancelled';
   }
-  ACT.restoreDraft = function (el) { var m = el.closest('.modal-backdrop'), d = lsGet(draftKey(m._form.id), null); if (d) { fillForm(m, d.data); m._form.dirty = true; } el.closest('.note').remove(); toast('Draft restored. It is still not saved to the server.', 'warn'); };
+  ACT.restoreDraft = function (el) { var m = el.closest('.modal-backdrop'), d = lsGet(draftKey(m._form.id), null); if (d) { restoreSnapshot(m, d.data); m._form.dirty = true; } el.closest('.note').remove(); toast('Draft restored. It is still not saved to the server.', 'warn'); };
   ACT.discardDraft = function (el) { var m = el.closest('.modal-backdrop'); lsDel(draftKey(m._form.id)); el.closest('.note').remove(); };
-  ACT.addItemRow = function (el) { var box = el.closest('.modal').querySelector('#items'), n = box.children.length; box.insertAdjacentHTML('beforeend', itemRow({}, n + '_' + Date.now())); box.lastElementChild.querySelector('input').focus(); };
-  ACT.removeItem = function (el) { var row = el.closest('.item-row'); if (row.dataset.id) { row.querySelector('[data-i=Status]').value = 'Cancelled'; row.querySelector('[data-i=Description]').disabled = true; el.disabled = true; } else row.remove(); el.closest('.modal-backdrop')._form.dirty = true; };
-  ACT.step = function (el) { setStep(el.closest('.modal-backdrop'), +el.dataset.i); };
-  ACT.stepNext = function (el) { var m = el.closest('.modal-backdrop'); setStep(m, Math.min(5, m._form.step + 1)); };
-  ACT.stepPrev = function (el) { var m = el.closest('.modal-backdrop'); setStep(m, Math.max(0, m._form.step - 1)); };
-  function setStep(m, i) {
-    m._form.step = i;
-    $$('.fsec', m).forEach(function (s) { s.classList.toggle('on', +s.dataset.sec === i); });
-    $$('.steps button', m).forEach(function (b) { if (+b.dataset.i === i) b.setAttribute('aria-current', 'step'); else b.removeAttribute('aria-current'); });
-    var first = $('.fsec.on input:not([disabled]),.fsec.on select:not([disabled]),.fsec.on textarea', m); if (first) first.focus();
-    m.scrollTop = 0;
-  }
+  ACT.addItemRow = function (el) { var box = el.closest('.modal').querySelector('#items'); box.insertAdjacentHTML('beforeend', itemRow({}, 'n' + Date.now())); box.lastElementChild.querySelector('input').focus(); el.closest('.modal-backdrop')._form.dirty = true; };
+  ACT.removeItem = function (el) {
+    var row = el.closest('.item-row');
+    if (row.dataset.id) { row.querySelector('[data-i=Status]').value = 'Cancelled'; row.querySelector('[data-i=Description]').disabled = true; el.disabled = true; }
+    else if ($$('.item-row', row.parentNode).length > 1) row.remove(); else row.querySelector('[data-i=Description]').value = '';
+    el.closest('.modal-backdrop')._form.dirty = true;
+  };
   ACT.applyTemplate = function (el) { var m = el.closest('.modal-backdrop'), id = $('#tpl-pick', m).value; if (!id) { toast('Choose a template first.', 'warn'); return; } applyTemplate(m, id); };
   function applyTemplate(m, tid) {
     var t = S.data.templates.filter(function (x) { return x.TemplateID === tid; })[0]; if (!t) return;
     var c = C.json(t.Content, {}), filled = 0;
-    function put(sel, v) { var el = $(sel, m); if (el && v && !el.value) { el.value = v; filled++; } }
-    if (t.CampaignID !== 'ALL' && !$('#fld-coaching-CampaignID', m).value) { var ce = $('#fld-coaching-CampaignID', m); ce.value = t.CampaignID; ce.dispatchEvent(new Event('change')); }
-    if (t.Category) { var cat = $('#fld-coaching-Category', m); if (!cat.value && Array.prototype.some.call(cat.options, function (o) { return o.value === t.Category; })) { cat.value = t.Category; filled++; } }
-    put('#fld-coaching-Title', c.Title); put('#fld-coaching-ExpectedStandard', c.ExpectedStandard); put('#fld-coaching-GuidanceProvided', c.GuidanceProvided); put('#fld-coaching-CoachingMethod', c.CoachingMethod);
-    put('#fld-plan-ExpectedImprovement', c.ExpectedImprovement); put('#fld-plan-SupportRequired', c.SupportRequired);
-    if (c.DiscussionPrompts) $('#prompts-hint', m).textContent = 'Template discussion prompts: ' + c.DiscussionPrompts;
+    function put(f, v) { var el = $('[data-f="' + f + '"]', m); if (el && v && !el.value) { el.value = v; filled++; } }
+    if (t.CampaignID !== 'ALL' && !fv(m, 'coaching.CampaignID')) { $('#fld-coaching-CampaignID', m).value = t.CampaignID; campaignChanged(m); }
+    if (t.Category) { var cat = $('#fld-coaching-Category', m); if (!cat.value && Array.prototype.some.call(cat.options, function (x) { return x.value === t.Category; })) { cat.value = t.Category; filled++; } }
+    put('coaching.CoachingMethod', c.CoachingMethod); put('coaching.ExpectedStandard', c.ExpectedStandard); put('plan.SupportRequired', c.SupportRequired);
+    if (c.DiscussionPrompts) { var ph = $('#prompts-hint', m); ph.hidden = false; ph.textContent = 'Discussion prompts: ' + c.DiscussionPrompts; }
     var box = $('#items', m);
     (c.ActionItems || []).forEach(function (txt2) {
       var empty = $$('.item-row', box).filter(function (r) { return !r.dataset.id && !r.querySelector('[data-i=Description]').value; })[0];
       if (empty) empty.querySelector('[data-i=Description]').value = txt2; else box.insertAdjacentHTML('beforeend', itemRow({ Description: txt2 }, 't' + Math.random().toString(36).slice(2, 7)));
       filled++;
     });
-    var hid = m.querySelector('[data-f="coaching.TemplateID"]'); if (!hid) $('.modal-b', m).insertAdjacentHTML('beforeend', '<input type="hidden" data-f="coaching.TemplateID" value="' + esc(tid) + '">'); else hid.value = tid;
-    m._form.dirty = true; toast('Template applied to ' + plural(filled, 'empty field') + '.', 'ok');
+    m._form.templateId = tid; m._form.dirty = true;
+    toast('Template applied to ' + plural(filled, 'empty field') + '.', 'ok');
   }
-  function buildPayload(m) {
-    var d = collectForm(m), F = m._form, c = d.c, p = d.p, om = isOM();
-    if (!om) { c.TeamLeadID = F.id ? F.base.TeamLeadID : S.user.teamLeadId; delete p.ResponsibleTeamLeadID; }
+
+  // Builds the server payload. Fields the simple form does not show are derived here,
+  // so every record stays measurable (KPI, baseline, target) and reports keep working.
+  function buildPayload(m, asDraft) {
+    var F = m._form, om = isOM(), mode = gapMode(m), d = snapshot(m), f = d.f;
+    var c = {};
+    ['AgentID', 'CampaignID', 'CoachingDate', 'Category', 'Status', 'Priority', 'SourceOfConcern', 'CancelReason', 'SupportingEvidence', 'RootCauseNotes', 'DiscussionSummary', 'CoachingMethod', 'AgentFeedback']
+      .forEach(function (k) { c[k] = f['coaching.' + k] === undefined ? '' : f['coaching.' + k]; });
+    if (asDraft) c.Status = 'Draft';
+    c.TeamLeadID = om ? f['coaching.TeamLeadID'] : (F.id ? F.base.TeamLeadID : S.user.teamLeadId);
+    c.RootCauses = d.rc;
+    c.AgentAcknowledged = !!f['coaching.AgentAcknowledged'];
+    c.AcknowledgedAt = c.AgentAcknowledged ? (F.base.AcknowledgedAt || c.CoachingDate) : '';
+    if (F.templateId) c.TemplateID = F.templateId;
+    var k = mode === 'kpi' ? S.idx.kpis[f['coaching.RelatedKPIID']] : null, actual = f['coaching.ActualValue'];
+    var p = { FollowUpDate: f['plan.FollowUpDate'], SupportRequired: f['plan.SupportRequired'] };
+    if (mode === 'kpi') {
+      var range = k && k.TargetDirection === 'Within Range';
+      c.GapType = 'Numeric'; c.RelatedKPIID = f['coaching.RelatedKPIID']; c.ActualValue = actual;
+      c.ExpectedValue = k ? (range ? (f['plan.TargetMin'] || k.TargetMin) : (k.TargetValue || '')) : '';
+      c.ExpectedStandard = k ? k.Name + ' ' + kpiTargetText(k) : '';
+      c.ActualPerformance = k && actual !== '' ? k.Name + ' ' + actual + unitSfx(k) : '';
+      var g = gapInfo(k, actual, f['plan.TargetValue'], f['plan.TargetMin'], f['plan.TargetMax']); c.PerformanceGap = g ? g.text : '';
+      p.TargetKPIID = c.RelatedKPIID; p.TargetDirection = k ? k.TargetDirection : '';
+      p.TargetValue = range ? '' : f['plan.TargetValue']; p.TargetMin = range ? f['plan.TargetMin'] : ''; p.TargetMax = range ? f['plan.TargetMax'] : '';
+      p.BaselineValue = actual;
+    } else {
+      c.GapType = 'Descriptive'; c.RelatedKPIID = ''; c.ActualValue = ''; c.ExpectedValue = ''; c.PerformanceGap = '';
+      c.ActualPerformance = f['coaching.ActualPerformance']; c.ExpectedStandard = f['coaching.ExpectedStandard'];
+      p.TargetKPIID = ''; p.TargetDirection = 'Qualitative Evaluation'; p.TargetValue = ''; p.TargetMin = ''; p.TargetMax = ''; p.BaselineValue = '';
+    }
+    if (!F.id) p.MonitoringStart = c.CoachingDate;
+    if (F.plan && (F.plan.TargetKPIID !== p.TargetKPIID || String(F.plan.TargetValue) !== String(p.TargetValue) || String(F.plan.TargetMin) !== String(p.TargetMin) || String(F.plan.TargetMax) !== String(p.TargetMax))) p.ExpectedImprovement = '';
     var items = d.items.filter(function (i) { return i.ActionItemID || (i.Description || '').trim() || i.Deadline; });
-    var planUsed = c.Status === 'Completed' || F.plan || Object.keys(p).some(function (k) { return k !== 'Status' && k !== 'ResponsibleTeamLeadID' && String(p[k] || '').trim(); }) || items.length;
-    if (F.plan && !C.isOpenPlan(F.plan.Status)) delete p.Status;
-    return { c: c, p: planUsed ? p : null, items: planUsed ? items : [] };
+    var planUsed = c.Status === 'Completed' || !!F.plan || items.length > 0;
+    return { c: c, p: planUsed ? p : null, items: planUsed ? items : [], mode: mode };
   }
   function showFormErrors(m, errors) {
     $$('.err', m).forEach(function (x) { x.hidden = true; x.textContent = ''; }); $$('[aria-invalid]', m).forEach(function (x) { x.removeAttribute('aria-invalid'); });
-    $$('.steps button', m).forEach(function (b) { b.classList.remove('has-err'); });
-    var secs = {}, list = [];
-    Object.keys(errors).forEach(function (k) {
-      var msg = errors[k], el = null, sec = 4, parts = k.split('.');
-      if (parts[0] === 'coaching') { el = $('#fld-coaching-' + parts[1] + '-e', m); sec = FIELD_SECTION[parts[1]] !== undefined ? FIELD_SECTION[parts[1]] : 0; }
-      else if (parts[0] === 'plan') el = $(parts[1] ? '#fld-plan-' + parts[1] + '-e' : '#fld-plan-e', m);
-      else if (parts[0] === 'items' && parts.length === 1) el = $('#fld-items-e', m);
+    var alias = { 'coaching.ExpectedValue': 'coaching.RelatedKPIID', 'plan.TargetDirection': 'coaching.RelatedKPIID', 'plan.TargetKPIID': 'coaching.RelatedKPIID', 'plan.ResponsibleTeamLeadID': 'coaching.TeamLeadID', 'plan.MonitoringEnd': 'plan.FollowUpDate', 'coaching.AcknowledgedAt': 'coaching.CoachingDate' };
+    var shown = {}, unplaced = [], first = null;
+    Object.keys(errors).forEach(function (key) {
+      var msg = errors[key], k2 = alias[key] || key, parts = k2.split('.'), el = null;
+      if (parts[0] === 'items' && parts.length === 1) el = $('#fld-items-e', m);
       else if (parts[0] === 'items') { var row = $$('.item-row', m)[+parts[1]]; el = row && row.querySelector('[data-ierr="' + parts[2] + '"]'); }
-      if (parts[0] === 'plan' && parts[1] === 'Status') sec = 5;
-      if (el) { el.hidden = false; el.textContent = msg; var inp = el.parentNode.querySelector('.input'); if (inp) inp.setAttribute('aria-invalid', 'true'); }
-      secs[sec] = true; list.push(msg);
+      else if (parts[0] === 'plan' && parts.length === 1) el = $('#fld-plan-e', m);
+      else el = $('#fld-' + parts[0] + '-' + parts[1] + '-e', m);
+      if (el && !el.parentNode.closest('[hidden]')) {
+        if (!shown[el.id || k2]) { el.hidden = false; el.textContent = msg; shown[el.id || k2] = true; }
+        var inp = el.parentNode.querySelector('.input'); if (inp) inp.setAttribute('aria-invalid', 'true');
+        if (!first) first = el;
+      } else unplaced.push(msg);
     });
-    Object.keys(secs).forEach(function (i) { var b = $('.steps button[data-i="' + i + '"]', m); if (b) b.classList.add('has-err'); });
-    var first = Math.min.apply(null, Object.keys(secs).map(Number));
-    if (isFinite(first)) setStep(m, first);
-    $('#cf-top', m).innerHTML = '<div class="note bad" role="alert" style="margin-bottom:12px">' + plural(list.length, 'field') + ' need attention. Sections with problems are marked in the list on the left.</div>';
+    $('#cf-top', m).innerHTML = '<div class="note bad" role="alert" style="margin-bottom:12px">' + plural(Object.keys(errors).length, 'item') + ' need attention' + (unplaced.length ? ': ' + esc(unplaced.join(' ')) : '. They are marked below.') + '</div>';
+    var target = first ? first.parentNode : $('#cf-top', m);
+    target.scrollIntoView({ block: 'center' });
+    var focusEl = first && first.parentNode.querySelector('.input,input'); if (focusEl) focusEl.focus();
   }
-  function submitCoaching(m) {
-    var F = m._form, d = buildPayload(m), btn = m.querySelector('#cf-save');
-    var errs = {}; var sessCheck = Object.assign({}, F.base, d.c);
-    var planCheck = d.p ? Object.assign({}, F.plan || {}, d.p, { ResponsibleTeamLeadID: d.p.ResponsibleTeamLeadID || (F.plan && F.plan.ResponsibleTeamLeadID) || d.c.TeamLeadID, TargetDirection: d.p.TargetDirection || (S.idx.kpis[d.p.TargetKPIID] || {}).TargetDirection || '' }) : null;
+  function submitCoaching(m, asDraft) {
+    var F = m._form, d = buildPayload(m, asDraft), btn = asDraft ? $('#cf-draft', m) : $('#cf-save', m);
+    var errs = {}, st = d.c.Status;
+    var sessCheck = Object.assign({}, F.base, d.c);
+    var planCheck = d.p ? Object.assign({}, F.plan || {}, d.p, { ResponsibleTeamLeadID: (F.plan && F.plan.ResponsibleTeamLeadID) || d.c.TeamLeadID }) : null;
     var itemsCheck = d.items.slice();
     if (F.plan) S.data.items.forEach(function (i) { if (i.ActionPlanID === F.plan.ActionPlanID && !itemsCheck.some(function (x) { return x.ActionItemID === i.ActionItemID; })) itemsCheck.push(i); });
     C.validateSession(sessCheck, planCheck, itemsCheck, S.today, errs);
-    if (planCheck && d.p.Status && ['Not Started', 'In Progress', 'Pending Follow-up'].indexOf(d.p.Status) < 0) errs['plan.Status'] = 'Choose an open status.';
+    if (d.mode === 'kpi' && st !== 'Draft' && st !== 'Cancelled') {
+      if (!d.c.RelatedKPIID) errs['coaching.RelatedKPIID'] = 'Choose the KPI, or switch to "Observed behaviour".';
+      if (C.n(d.c.ActualValue) === null) errs['coaching.ActualValue'] = 'Enter the current result.';
+    }
+    if (errs['items'] ) errs['items'] = 'Add at least one action the agent will take.';
     if (Object.keys(errs).length) { showFormErrors(m, errs); return; }
     $('#cf-top', m).innerHTML = '';
     busy(btn, true);
@@ -3332,7 +3435,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     call.then(function (res) {
       lsDel(draftKey(F.id)); F.dirty = false; closeModal(true); render();
       var id = res.primary && res.primary.id;
-      toast((F.id ? 'Saved changes to ' : 'Saved coaching record ') + (id || '') + (res.duplicate ? ' (already saved earlier; no duplicate created)' : '') + '.', 'ok');
+      toast((asDraft ? 'Draft saved: ' : F.id ? 'Saved changes to ' : 'Saved coaching record ') + (id || '') + (res.duplicate ? ' (already saved earlier; no duplicate created)' : '') + '.', 'ok');
       if (id) openSession(id);
     }, function (e) {
       busy(btn, false);
@@ -3736,7 +3839,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     return '<div class="page-head"><div><p>Templates pre-fill empty fields in a new coaching record. Team leads can use them; Operations Managers maintain them.</p></div><div class="actions">' + (isOM() ? '<button class="btn btn-primary" data-act="editTemplate">New template</button>' : '') + '</div></div>' +
       '<section class="panel">' + (list.length ? '<div class="table-wrap"><table class="t"><thead><tr><th>Template</th><th>Campaign</th><th>Category</th><th>Method</th><th class="num">Action items</th><th>Status</th><th></th></tr></thead><tbody>' + list.map(function (t) {
         var c = C.json(t.Content, {});
-        return '<tr><td class="t-title">' + esc(t.Name) + synTag(t) + '<div class="t-sub">' + esc(c.Title || '') + '</div></td><td>' + esc(campName(t.CampaignID)) + '</td><td>' + esc(t.Category || '—') + '</td><td>' + esc(c.CoachingMethod || '—') + '</td><td class="num">' + (c.ActionItems || []).length + '</td><td>' + sb(C.b(t.Active) ? 'Active' : 'Inactive') + '</td><td><div class="row" style="justify-content:flex-end">' +
+        return '<tr><td class="t-title">' + esc(t.Name) + synTag(t) + '</td><td>' + esc(campName(t.CampaignID)) + '</td><td>' + esc(t.Category || '—') + '</td><td>' + esc(c.CoachingMethod || '—') + '</td><td class="num">' + (c.ActionItems || []).length + '</td><td>' + sb(C.b(t.Active) ? 'Active' : 'Inactive') + '</td><td><div class="row" style="justify-content:flex-end">' +
           (capCreate() && C.b(t.Active) ? '<button class="btn btn-sm" data-act="newCoaching" data-template="' + t.TemplateID + '">Use</button>' : '') + (isOM() ? '<button class="btn btn-sm" data-act="editTemplate" data-id="' + t.TemplateID + '">Edit</button>' : '') + '</div></td></tr>';
       }).join('') + '</tbody></table></div>' : emptyState('No templates', isOM() ? 'Create one to standardize common coaching conversations.' : 'Ask an Operations Manager to add templates.')) + '</section>';
   };
@@ -3745,8 +3848,8 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     simpleForm({ title: t ? 'Edit template' : 'New template', size: 'lg', rec: t, idKey: 'TemplateID', action: 'saveTemplate', done: 'Template saved.', fields: [
       { k: 'Name', label: 'Template name', req: true, max: 120 }, { k: 'CampaignID', label: 'Campaign', type: 'select', req: true, options: opts([['ALL', 'All campaigns']].concat(liveCamps().map(function (x) { return [x.CampaignID, x.Name]; })), t ? t.CampaignID : 'ALL') },
       { k: 'Category', label: 'Category', max: 100, hint: 'Must match a category of the selected campaign (leave blank for all-campaign templates).' }, { k: 'Active', label: 'Availability', type: 'bool', text: 'Active', def: true },
-      { k: 'c_Title', label: 'Coaching title', value: c.Title || '', max: 150 }, { k: 'c_CoachingMethod', label: 'Coaching method', type: 'select', options: opts(C.METHODS, c.CoachingMethod || '', 'None') },
-      { k: 'c_ExpectedStandard', label: 'Expected standard', type: 'textarea', value: c.ExpectedStandard || '', max: 1000 }, { k: 'c_GuidanceProvided', label: 'Guidance', type: 'textarea', value: c.GuidanceProvided || '', max: 4000 },
+      { k: 'c_CoachingMethod', label: 'Coaching method', type: 'select', options: opts(C.METHODS, c.CoachingMethod || '', 'None') },
+      { k: 'c_ExpectedStandard', label: 'What is expected (for observed-behaviour coaching)', type: 'textarea', value: c.ExpectedStandard || '', max: 1000 },
       { k: 'c_DiscussionPrompts', label: 'Discussion prompts', type: 'textarea', value: c.DiscussionPrompts || '', max: 2000 }, { k: 'c_ExpectedImprovement', label: 'Expected improvement', type: 'textarea', value: c.ExpectedImprovement || '', max: 2000 },
       { k: 'c_SupportRequired', label: 'Support required', type: 'textarea', value: c.SupportRequired || '', max: 2000 }, { k: 'c_ActionItems', label: 'Action items (one per line)', type: 'textarea', value: (c.ActionItems || []).join('\n'), max: 6000 }],
       transform: function (r) {
