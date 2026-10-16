@@ -2252,6 +2252,8 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
   function uuid() { if (window.crypto && crypto.randomUUID) return crypto.randomUUID().replace(/-/g, ''); return (Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)).slice(0, 32); }
+  // Request IDs carry their creation time so the server can search only recent sync history.
+  function requestId() { return 't' + Date.now().toString(36) + '_' + uuid().slice(0, 24); }
   function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function debounce(fn, ms) { var t; return function () { var a = arguments, self = this; clearTimeout(t); t = setTimeout(function () { fn.apply(self, a); }, ms); }; }
   function initials(name) { return String(name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(function (x) { return x[0]; }).join('').toUpperCase(); }
@@ -2296,6 +2298,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     S.settings = C.settingsWithDefaults(d.settings || {});
     if (d.user) { S.user = d.user; S.user.role = C.normRole(S.user.role); S.user.roleLabel = C.ROLE_LABELS[S.user.role] || S.user.roleLabel; }
     S.today = d.today || todayTz();
+    S.lastLoad = Date.now();
     reindex();
   }
   function reindex() { S.idx = C.buildIndex(S.data); }
@@ -2434,7 +2437,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
         body: JSON.stringify({ action: action, payload: payload, requestId: requestId, idToken: tok }) })
         .then(function (r) {
           clearTimeout(timer);
-          if (!r.ok) throw netErr('The server responded with HTTP ' + r.status + '.');
+          if (!r.ok) { var ne = netErr('Google did not return a response (HTTP ' + r.status + '). This is usually temporary.'); ne.httpStatus = r.status; throw ne; }
           return r.json().catch(function () { throw netErr('The server returned an unexpected response. Check API_URL and that the web app is deployed with the documented access setting.'); });
         }, function (e) { clearTimeout(timer); throw netErr(e && e.name === 'AbortError' ? 'The request timed out.' : 'Could not reach the server. Check your connection.'); })
         .then(function (j) { if (!j || typeof j.ok !== 'boolean') throw netErr('Unexpected response from the server.'); if (!j.ok) throw j.error; return j.data; });
@@ -2473,10 +2476,22 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   function savePending() { lsSet(pendKey(), S.sync.pending); paintSync(); }
   function isRetryable(e) { return !!(e && (e.retryable || e.code === 'NETWORK' || e.code === 'BUSY' || e.code === 'SERVER_ERROR')); }
 
+  // Reads are safe to repeat; writes are retried separately with the same request ID (idempotent).
+  function callWithRetry(action, payload, tries) {
+    var n = 0;
+    function go() {
+      return S.transport.call(action, payload || {}, '').catch(function (e) {
+        if (isRetryable(e) && n < (tries || 3)) { n++; return wait(700 * Math.pow(2, n - 1)).then(go); }
+        if (e && isRetryable(e) && n) e.message += ' Tried ' + (n + 1) + ' times. Wait a minute and try again; if it keeps happening, tell your administrator.';
+        throw e;
+      });
+    }
+    return go();
+  }
   var Api = {
     read: function (action, payload) {
       var prev = S.sync.state; setSync('syncing');
-      return S.transport.call(action, payload || {}, '').then(function (r) { setSync(prev === 'conflict' || prev === 'failed' ? 'connected' : (prev === 'syncing' ? 'connected' : prev)); return r; },
+      return callWithRetry(action, payload, 3).then(function (r) { setSync(prev === 'conflict' || prev === 'failed' ? 'connected' : (prev === 'syncing' ? 'connected' : prev)); return r; },
         function (e) {
           if (e && e.code === 'UNAUTHENTICATED' && S.mode === 'http' && S.user) return reauth().then(function () { return Api.read(action, payload); });
           setSync(isRetryable(e) ? 'failed' : 'connected', e && e.message); throw e;
@@ -2484,13 +2499,13 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     },
     write: function (action, payload, label, opts) {
       opts = opts || {};
-      var rid = opts.requestId || uuid(), attempt = 0;
+      var rid = opts.requestId || requestId(), attempt = 0;
       setSync('syncing', label);
       function run() {
         return S.transport.call(action, payload, rid).then(function (res) {
           applyResult(res); setSync('saved', label); return res;
         }, function (e) {
-          if (isRetryable(e) && attempt < 2) { attempt++; return wait(attempt === 1 ? 1000 : 3000).then(run); }
+          if (isRetryable(e) && attempt < 3) { attempt++; return wait([1000, 2500, 5000][attempt - 1]).then(run); }
           if (e && e.code === 'UNAUTHENTICATED' && S.mode === 'http' && !opts.reauthed) { opts.reauthed = true; return reauth().then(run); }
           if (isRetryable(e) && !opts.noQueue) {
             S.sync.pending.push({ requestId: rid, action: action, payload: payload, label: label || action, createdAt: new Date().toISOString(), lastError: e.message });
@@ -2745,7 +2760,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     if (mode === 'demo') S.transport = S.demoT; else if (mode === 'http') S.transport = new HttpTransport(); else S.transport = new GasTransport();
     S.mode = mode;
     $('#app').innerHTML = '<div class="loading" role="status"><span class="spinner"></span>Loading coaching records…</div>';
-    S.transport.call('bootstrap', {}, '').then(function (d) {
+    callWithRetry('bootstrap', {}, 3).then(function (d) {
       setData(d);
       S.sync.pending = lsGet(pendKey(), []) || [];
       S.f = {}; renderShell(); routeFromHash(); setSync('connected');
@@ -4081,6 +4096,34 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     $('#gsearch-res').innerHTML = ''; $('#gsearch').value = '';
     if (el.dataset.type === 'agent') go('agents', el.dataset.id); else if (el.dataset.type === 'tl') go('teamleads', el.dataset.id); else openSession(el.dataset.id);
   };
+
+  // ================= background refresh =================
+  // Every 5 minutes while the tab is visible, and when you return to the tab after 2+ minutes away.
+  // Never while a dialog or form is open, while typing in the page, or while a save is in progress.
+  var AUTO_EVERY = 5 * 60000, AUTO_ON_RETURN = 2 * 60000, autoBusy = false;
+  function canAutoRefresh() {
+    if (!S.user || !S.transport || autoBusy || modalStack.length || document.visibilityState !== 'visible') return false;
+    if (S.sync.state === 'syncing' || (S.mode !== 'demo' && !navigator.onLine)) return false;
+    var a = document.activeElement;
+    if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.id !== 'gsearch' && $('#page') && $('#page').contains(a)) return false;
+    if ($('.menu,.search-results')) return false;
+    return true;
+  }
+  function autoRefresh() {
+    if (!canAutoRefresh()) return;
+    autoBusy = true;
+    var main = $('#main'), top = main ? main.scrollTop : 0;
+    Api.read('bootstrap', { includeArchived: S.showArchived }).then(function (d) {
+      autoBusy = false;
+      if (modalStack.length) { setData(d); return; }          // a dialog opened meanwhile: update data, redraw later
+      setData(d); render(); if (main) main.scrollTop = top;
+    }, function () { autoBusy = false; });
+  }
+  setInterval(function () { if (S.lastLoad && Date.now() - S.lastLoad >= AUTO_EVERY) autoRefresh(); }, 30000);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible' && S.lastLoad && Date.now() - S.lastLoad >= AUTO_ON_RETURN) autoRefresh();
+  });
+  window.__AGS_autoRefreshNow = function () { S.lastLoad = 0; autoRefresh(); };   // used by automated tests only
 
   // ================= boot =================
   (function () { var t = lsGet('ags_theme', null); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; })();
