@@ -521,7 +521,7 @@ var AGSCore = (function () {
     KPIConfig: ['KPIID', 'CampaignID', 'Name', 'Description', 'Unit', 'TargetValue', 'TargetMin', 'TargetMax', 'TargetDirection',
       'EvaluationPeriod', 'Active'].concat(META),
     Templates: ['TemplateID', 'CampaignID', 'Name', 'Category', 'Content', 'Active'].concat(META),
-    Users: ['UserID', 'Email', 'DisplayName', 'Role', 'TeamLeadID', 'Active'].concat(META),
+    Users: ['UserID', 'Email', 'DisplayName', 'Role', 'TeamLeadID', 'Active', 'CampaignIDs'].concat(META),
     DevelopmentPlans: ['DevelopmentID', 'AgentID', 'SkillArea', 'Objective', 'RecommendedTraining', 'ProgressNotes', 'TargetDate', 'Status'].concat(META),
     AlertReviews: ['AlertReviewID', 'AlertKey', 'AgentID', 'Category', 'CoachingIDs', 'ReviewOutcome', 'ReviewNote'].concat(META),
     AuditLog: ['AuditID', 'Timestamp', 'ActorEmail', 'ActorRole', 'Action', 'EntityType', 'EntityID', 'RequestID', 'ChangedFields', 'Details'],
@@ -634,7 +634,7 @@ var AGSCore = (function () {
     kpis: { CampaignID: ID, Name: T(100), Description: T(1000), Unit: T(30), TargetValue: N, TargetMin: N, TargetMax: N,
       TargetDirection: E(DIRECTIONS), EvaluationPeriod: T(60), Active: B },
     templates: { CampaignID: { t: 'id', allow: ['ALL'] }, Name: T(120), Category: T(100), Content: J, Active: B },
-    users: { Email: T(200), DisplayName: T(120), Role: E(ASSIGNABLE_ROLES), TeamLeadID: ID, Active: B },
+    users: { Email: T(200), DisplayName: T(120), Role: E(ASSIGNABLE_ROLES), TeamLeadID: ID, Active: B, CampaignIDs: T(500) },
     development: { AgentID: ID, SkillArea: T(150), Objective: T(1000), RecommendedTraining: T(1000), ProgressNotes: T(4000),
       TargetDate: D, Status: E(DEV_STATUSES) }
   };
@@ -1298,8 +1298,12 @@ var AGSCore = (function () {
         Details: details && Object.keys(details).length ? JSON.stringify(details).slice(0, 4000) : '' });
     };
     ctx.find = function (entity, id) { return id ? repo.get(entity, id) : null; };
+    var scopeMemo = null;
+    ctx.scope = function () { return scopeMemo || (scopeMemo = buildScope(repo, user)); };
+    ctx.visible = function (entity, r) { return inScope(ctx.scope(), entity, r); };
     ctx.get = function (entity, id, allowArchived) {
       var r = id ? repo.get(entity, id) : null;
+      if (r && entity !== 'users' && !ctx.visible(entity, r)) r = null;
       if (!r || (r.ArchivedAt && !allowArchived)) throw AgsError('NOT_FOUND', ENTITIES[entity].label + ' ' + s(id) + ' was not found or has been archived.');
       return r;
     };
@@ -1343,17 +1347,60 @@ var AGSCore = (function () {
     return ctx;
   }
 
+  // ---------- data scope: who may see which records ----------
+  // Admin: everything. Manager / Quality: campaigns assigned in Users.CampaignIDs (none assigned = nothing).
+  // Team Lead: their own agents (Agents.TeamLeadID), records they wrote or own, and plans assigned to them.
+  function splitIds(v) { return s(v).split(',').map(function (x) { return x.trim(); }).filter(Boolean); }
+  function buildScope(repo, u) {
+    if (isAdmin(u)) return { all: true };
+    var sc = { all: false, tl: u.role === ROLES.TL, camps: {}, ownAgents: {}, agents: {}, tls: {}, sessions: {} };
+    if (sc.tl) {
+      var me = u.teamLeadId, tlRec = me ? repo.get('teamLeads', me) : null, resp = {};
+      if (!me) return sc;
+      sc.tls[me] = true;
+      if (tlRec) splitIds(tlRec.CampaignIDs).forEach(function (c) { sc.camps[c] = true; });
+      repo.all('agents').forEach(function (a) { if (a.TeamLeadID === me) { sc.ownAgents[a.AgentID] = sc.agents[a.AgentID] = true; sc.camps[a.CampaignID] = true; } });
+      repo.all('plans').forEach(function (p) { if (p.ResponsibleTeamLeadID === me) resp[p.CoachingID] = true; });
+      repo.all('sessions').forEach(function (x) {
+        if (x.TeamLeadID === me || sc.ownAgents[x.AgentID] || resp[x.CoachingID]) { sc.sessions[x.CoachingID] = true; sc.agents[x.AgentID] = true; sc.tls[x.TeamLeadID] = true; }
+      });
+    } else {
+      (u.campaignIds || []).forEach(function (c) { sc.camps[c] = true; });
+      repo.all('agents').forEach(function (a) { if (sc.camps[a.CampaignID]) sc.ownAgents[a.AgentID] = sc.agents[a.AgentID] = true; });
+      repo.all('teamLeads').forEach(function (t) { if (splitIds(t.CampaignIDs).some(function (c) { return sc.camps[c]; })) sc.tls[t.TeamLeadID] = true; });
+      repo.all('sessions').forEach(function (x) { if (sc.camps[x.CampaignID]) { sc.sessions[x.CoachingID] = true; sc.tls[x.TeamLeadID] = true; } });
+    }
+    return sc;
+  }
+  function inScope(sc, entity, r) {
+    if (!r) return false;
+    if (sc.all) return true;
+    switch (entity) {
+      case 'campaigns': case 'kpis': return !!sc.camps[r.CampaignID];
+      case 'templates': return r.CampaignID === 'ALL' || !!sc.camps[r.CampaignID];
+      case 'teamLeads': return !!sc.tls[r.TeamLeadID];
+      case 'agents': return !!sc.agents[r.AgentID];
+      case 'sessions': case 'plans': case 'items': case 'followUps': return !!sc.sessions[r.CoachingID];
+      case 'development': case 'alertReviews': return !!sc.ownAgents[r.AgentID];
+      default: return true;
+    }
+  }
+  function scopeData(sc, data) {
+    var out = {}; Object.keys(data).forEach(function (e) { out[e] = DATA_ENTITIES.indexOf(e) >= 0 ? data[e].filter(function (r) { return inScope(sc, e, r); }) : data[e]; });
+    return out;
+  }
   function resolveUser(usersList, email) {
     var e = s(email).toLowerCase().trim();
     var u = (usersList || []).filter(function (r) { return live(r) && s(r.Email).toLowerCase().trim() === e; })[0];
     if (!u || !b(u.Active)) return null;
     var role = normRole(u.Role);
     if (ASSIGNABLE_ROLES.indexOf(role) < 0) return null;
-    return { email: e, role: role, teamLeadId: role === ROLES.QUALITY ? '' : s(u.TeamLeadID), displayName: u.DisplayName || e, userId: u.UserID, active: true };
+    return { email: e, role: role, teamLeadId: role === ROLES.QUALITY ? '' : s(u.TeamLeadID), displayName: u.DisplayName || e, userId: u.UserID, active: true,
+      campaignIds: role === ROLES.MANAGER || role === ROLES.QUALITY ? splitIds(u.CampaignIDs) : [] };
   }
 
   function publicUser(u) {
-    return { email: u.email, role: u.role, roleLabel: ROLE_LABELS[u.role] || u.role, teamLeadId: u.teamLeadId, displayName: u.displayName, userId: u.userId, capabilities: capabilities(u) };
+    return { email: u.email, role: u.role, roleLabel: ROLE_LABELS[u.role] || u.role, campaignIds: u.campaignIds || [], teamLeadId: u.teamLeadId, displayName: u.displayName, userId: u.userId, capabilities: capabilities(u) };
   }
 
   // ---------- helpers shared by handlers ----------
@@ -1389,7 +1436,7 @@ var AGSCore = (function () {
     if (!merged.ResponsibleTeamLeadID) merged.ResponsibleTeamLeadID = se.TeamLeadID;
     if (existing && p.ResponsibleTeamLeadID && p.ResponsibleTeamLeadID !== existing.ResponsibleTeamLeadID && !isOM(ctx.user)) errors['plan.ResponsibleTeamLeadID'] = 'Only an Admin or Manager can reassign plan responsibility.';
     if (!merged.Status) merged.Status = 'Not Started';
-    if (merged.ResponsibleTeamLeadID) { var tl = ctx.find('teamLeads', merged.ResponsibleTeamLeadID); if (!tl || tl.ArchivedAt) errors['plan.ResponsibleTeamLeadID'] = 'Select an existing team lead.'; }
+    if (merged.ResponsibleTeamLeadID) { var tl = ctx.find('teamLeads', merged.ResponsibleTeamLeadID); if (!tl || tl.ArchivedAt) errors['plan.ResponsibleTeamLeadID'] = 'Select an existing team lead.'; else if (!ctx.scope().all && !ctx.scope().tls[tl.TeamLeadID]) errors['plan.ResponsibleTeamLeadID'] = 'This team lead is outside your campaigns.'; }
     if (merged.TargetKPIID) {
       var k = ctx.find('kpis', merged.TargetKPIID);
       if (!k || k.ArchivedAt || k.CampaignID !== se.CampaignID) errors['plan.TargetKPIID'] = 'Select a KPI configured for this campaign.';
@@ -1448,13 +1495,21 @@ var AGSCore = (function () {
     return done.length ? done[done.length - 1] : null;
   }
   function forbid(msg) { throw AgsError('FORBIDDEN', msg); }
+  function scopeRefs(ctx, se, errors) {
+    var sc = ctx.scope(); if (sc.all) return;
+    var agent = ctx.find('agents', se.AgentID);
+    if (agent && !sc.ownAgents[agent.AgentID]) errors['coaching.AgentID'] = sc.tl ? 'You can coach only agents on your team.' : 'This agent is outside your campaigns.';
+    if (se.CampaignID && !sc.camps[se.CampaignID]) errors['coaching.CampaignID'] = 'This campaign is outside your access.';
+    if (se.TeamLeadID && !sc.tls[se.TeamLeadID]) errors['coaching.TeamLeadID'] = 'This team lead is outside your campaigns.';
+  }
+  function campsInScope(ctx, ids) { var sc = ctx.scope(); return sc.all || ids.every(function (c) { return sc.camps[c]; }); }
 
   // ---------- handlers ----------
   var H = {};
   H.whoami = { fn: function (ctx) { return { user: publicUser(ctx.user), serverTime: ctx.now, today: ctx.today, coreVersion: CORE_VERSION }; } };
   H.bootstrap = { fn: function (ctx, p) {
     var inclArch = isOM(ctx.user) && !!p.includeArchived, out = {};
-    DATA_ENTITIES.forEach(function (e) { out[e] = ctx.repo.all(e).filter(function (r) { return inclArch || live(r); }); });
+    DATA_ENTITIES.forEach(function (e) { out[e] = ctx.repo.all(e).filter(function (r) { return (inclArch || live(r)) && ctx.visible(e, r); }); });
     out.users = isAdmin(ctx.user) ? ctx.repo.all('users') : ctx.repo.all('users').filter(function (r) { return s(r.Email).toLowerCase() === ctx.user.email; });
     out.settings = ctx.settings; out.user = publicUser(ctx.user); out.serverTime = ctx.now; out.today = ctx.today; out.coreVersion = CORE_VERSION;
     return out;
@@ -1473,6 +1528,7 @@ var AGSCore = (function () {
     if (!c.GapType) c.GapType = 'Descriptive';
     if (!c.Title) c.Title = autoTitle(c, c.RelatedKPIID ? ctx.find('kpis', c.RelatedKPIID) : null);
     var refs = checkRefs(ctx, c, errors, true);
+    scopeRefs(ctx, c, errors);
     if (refs.agent && refs.agent.Status === 'Inactive') errors['coaching.AgentID'] = 'This agent is inactive.';
     if (refs.camp && refs.camp.Status === 'Inactive') errors['coaching.CampaignID'] = 'This campaign is inactive.';
     var plan = null, items = [];
@@ -1504,6 +1560,7 @@ var AGSCore = (function () {
       c.Title = m.Title = autoTitle(m, m.RelatedKPIID ? ctx.find('kpis', m.RelatedKPIID) : null);
     }
     checkRefs(ctx, m, errors, (c.Category && c.Category !== cur.Category) || (c.CampaignID && c.CampaignID !== cur.CampaignID));
+    if ((c.AgentID && c.AgentID !== cur.AgentID) || (c.CampaignID && c.CampaignID !== cur.CampaignID) || (c.TeamLeadID && c.TeamLeadID !== cur.TeamLeadID)) scopeRefs(ctx, m, errors);
     var kids = children(ctx, cur.CoachingID), planPrep = null, itemPrep = [];
     if (p.actionPlan) {
       if (kids.plan) { if (!canManagePlan(u, kids.plan, cur)) forbid('You cannot change this action plan.'); checkVersion('plans', kids.plan, p.planExpectedVersion); }
@@ -1546,6 +1603,7 @@ var AGSCore = (function () {
     var fus = ctx.list('followUps', function (x) { return x.ActionPlanID === plan.ActionPlanID; });
     var items = ctx.list('items', function (i) { return i.ActionPlanID === plan.ActionPlanID; });
     if (c.ResponsibleTeamLeadID && c.ResponsibleTeamLeadID !== plan.ResponsibleTeamLeadID && !isOM(u)) forbid('Only an Admin or Manager can reassign plan responsibility.');
+    if (c.ResponsibleTeamLeadID && !ctx.scope().all && !ctx.scope().tls[c.ResponsibleTeamLeadID]) forbid('This team lead is outside your campaigns.');
     if (c.Status && c.Status !== plan.Status) {
       if (c.Status === 'Overdue') errors['plan.Status'] = 'Overdue is calculated automatically from follow-up dates.';
       if (c.Status === 'Resolved') { var lo = latestEvaluated(fus); if (!lo || lo.Outcome !== 'Target Achieved') errors['plan.Status'] = 'Mark a plan Resolved only after a follow-up records "Target Achieved".'; }
@@ -1698,6 +1756,7 @@ var AGSCore = (function () {
     if (ARCHIVABLE.indexOf(p.entity) < 0) throw AgsError('VALIDATION', 'This record type cannot be archived.');
     var reason = s(p.reason).replace(CTRL_RE, '').trim().slice(0, 300);
     if (reason.length < 5) throw AgsError('VALIDATION', 'Some fields need attention.', { fields: { reason: 'Give a reason (at least 5 characters).' } });
+    if (p.entity === 'campaigns' && !isAdmin(ctx.user)) forbid('Only an Admin can archive campaigns.');
     var cur = ctx.get(p.entity, p.id);
     checkVersion(p.entity, cur, p.expectedVersion);
     var kids = cascadeIds(ctx, p.entity, p.id);
@@ -1739,6 +1798,8 @@ var AGSCore = (function () {
       requireFields(e, m, ['FullName', 'CampaignID'], '');
       if (m.CampaignID && !ctx.find('campaigns', m.CampaignID)) e.CampaignID = 'Select an existing campaign.';
       if (m.TeamLeadID && !ctx.find('teamLeads', m.TeamLeadID)) e.TeamLeadID = 'Select an existing team lead.';
+      if (m.CampaignID && !campsInScope(ctx, [m.CampaignID])) e.CampaignID = 'This campaign is outside your access.';
+      if (m.TeamLeadID && !ctx.scope().all && !ctx.scope().tls[m.TeamLeadID]) e.TeamLeadID = 'This team lead is outside your campaigns.';
       if (m.Email && !isEmail(m.Email)) e.Email = 'Enter a valid email address.';
       if (m.EmployeeID && !uniqueAmong(ctx, 'agents', 'EmployeeID', m.EmployeeID, ex && ex.AgentID)) e.EmployeeID = 'Another agent already uses this employee ID.';
     });
@@ -1751,9 +1812,11 @@ var AGSCore = (function () {
       if (m.Email && !isEmail(m.Email)) e.Email = 'Enter a valid email address.';
       else if (m.Email && !uniqueAmong(ctx, 'teamLeads', 'Email', m.Email, ex && ex.TeamLeadID, true)) e.Email = 'Another team lead already uses this email.';
       s(m.CampaignIDs).split(',').map(function (x) { return x.trim(); }).filter(Boolean).forEach(function (cid) { if (!ctx.find('campaigns', cid)) e.CampaignIDs = 'Unknown campaign: ' + cid; });
+      if (f.CampaignIDs !== undefined && !campsInScope(ctx, splitIds(f.CampaignIDs))) e.CampaignIDs = 'You can assign only campaigns you manage.';
     });
   } };
   H.saveCampaign = { write: true, om: true, fn: function (ctx, p) {
+    if (!(p.record && p.record.CampaignID) && !isAdmin(ctx.user)) forbid('Only an Admin can create campaigns.');
     saveEntity(ctx, 'campaigns', p, function (m, e, ex, f) {
       if (!m.Status) m.Status = f.Status = 'Active';
       requireFields(e, m, ['Name'], '');
@@ -1772,6 +1835,7 @@ var AGSCore = (function () {
       if (!s(m.Active)) m.Active = f.Active = 'TRUE';
       requireFields(e, m, ['CampaignID', 'Name', 'Unit', 'TargetDirection', 'EvaluationPeriod'], '');
       if (m.CampaignID && !ctx.find('campaigns', m.CampaignID)) e.CampaignID = 'Select an existing campaign.';
+      else if (m.CampaignID && !campsInScope(ctx, [m.CampaignID])) e.CampaignID = 'This campaign is outside your access.';
       if ((m.TargetDirection === 'Higher Is Better' || m.TargetDirection === 'Lower Is Better') && n(m.TargetValue) === null) e.TargetValue = 'Enter the target value.';
       if (m.TargetDirection === 'Within Range') {
         if (n(m.TargetMin) === null) e.TargetMin = 'Enter the minimum.';
@@ -1786,6 +1850,8 @@ var AGSCore = (function () {
     saveEntity(ctx, 'templates', p, function (m, e, ex, f) {
       if (!s(m.Active)) m.Active = f.Active = 'TRUE';
       requireFields(e, m, ['Name', 'CampaignID'], '');
+      if (m.CampaignID === 'ALL' && !isAdmin(ctx.user)) e.CampaignID = 'Only an Admin can create or edit templates for all campaigns.';
+      else if (m.CampaignID && m.CampaignID !== 'ALL' && !campsInScope(ctx, [m.CampaignID])) e.CampaignID = 'This campaign is outside your access.';
       if (m.CampaignID && m.CampaignID !== 'ALL') {
         var camp = ctx.find('campaigns', m.CampaignID);
         if (!camp) e.CampaignID = 'Select a campaign or "All campaigns".';
@@ -1811,6 +1877,11 @@ var AGSCore = (function () {
       if (m.Role === ROLES.TL && !m.TeamLeadID) e.TeamLeadID = 'Link the team lead profile for this user.';
       if (m.Role === ROLES.QUALITY && m.TeamLeadID) e.TeamLeadID = 'Quality users are not linked to a team lead profile. Choose "None".';
       if (m.TeamLeadID && !ctx.find('teamLeads', m.TeamLeadID)) e.TeamLeadID = 'Select an existing team lead.';
+      var cids = splitIds(m.CampaignIDs);
+      if (m.Role === ROLES.MANAGER || m.Role === ROLES.QUALITY) {
+        if (!cids.length) e.CampaignIDs = 'Assign at least one campaign. Managers and Quality see only their assigned campaigns.';
+        cids.forEach(function (cid) { if (!ctx.find('campaigns', cid)) e.CampaignIDs = 'Unknown campaign: ' + cid; });
+      } else if (s(m.CampaignIDs)) { m.CampaignIDs = f.CampaignIDs = ''; }
       var self = ex && s(ex.Email).toLowerCase() === ctx.user.email;
       if (self && ((f.Role && f.Role !== ex.Role) || (f.Active && f.Active !== ex.Active) || (f.Email && f.Email !== s(ex.Email).toLowerCase()))) forbid('You cannot change your own role, access or sign-in email. Ask another Admin.');
       if (ex && isAdminRole(ex.Role) && b(ex.Active) && (!isAdminRole(m.Role) || !b(m.Active))) {
@@ -1830,6 +1901,7 @@ var AGSCore = (function () {
       if (!m.Status) m.Status = f.Status = 'Not Started';
       requireFields(e, m, ['AgentID', 'SkillArea', 'Objective'], '');
       if (m.AgentID && !ctx.find('agents', m.AgentID)) e.AgentID = 'Select an existing agent.';
+      else if (m.AgentID && !ctx.scope().all && !ctx.scope().ownAgents[m.AgentID]) e.AgentID = 'You can add development items only for your own agents.';
     });
   } };
   var SETTING_RULES = {
@@ -1893,7 +1965,7 @@ var AGSCore = (function () {
     return { rows: rows.map(function (r) { return { Timestamp: r.Timestamp, ActorEmail: r.ActorEmail, Action: r.Action, EntityType: r.EntityType, EntityID: r.EntityID, ChangedFields: r.ChangedFields, Details: r.Details }; }) };
   } };
   H.getAnalytics = { fn: function (ctx, p) {
-    var data = {}; DATA_ENTITIES.forEach(function (e) { data[e] = ctx.repo.all(e); });
+    var data = {}; DATA_ENTITIES.forEach(function (e) { data[e] = ctx.repo.all(e).filter(function (r) { return ctx.visible(e, r); }); });
     return computeAnalytics(data, p.filters || {}, ctx.today, ctx.settings);
   } };
   H.logExport = { write: true, fn: function (ctx, p) {
@@ -1992,8 +2064,10 @@ var AGSCore = (function () {
       });
     });
     D.users.unshift(rec('users', { Email: 'celeste.navarro@example.com', DisplayName: 'Celeste Navarro', Role: ROLES.ADMIN, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
-    D.users.push(rec('users', { Email: 'lea.fernandez@example.com', DisplayName: 'Lea Fernandez', Role: ROLES.QUALITY, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
-    D.users.push(rec('users', { Email: 'dominic.reyes@example.com', DisplayName: 'Dominic Reyes', Role: ROLES.MANAGER, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
+    var cid = function (nm) { return (campByName[nm] || {}).CampaignID || ''; };
+    D.users.push(rec('users', { Email: 'lea.fernandez@example.com', DisplayName: 'Lea Fernandez', Role: ROLES.QUALITY, TeamLeadID: '', Active: 'TRUE', CampaignIDs: [cid('Legacy'), cid('Takahami')].filter(Boolean).join(',') }, addDays(today, -150)));
+    D.users.push(rec('users', { Email: 'dominic.reyes@example.com', DisplayName: 'Dominic Reyes', Role: ROLES.MANAGER, TeamLeadID: '', Active: 'TRUE', CampaignIDs: [cid('Legacy'), cid('Banyan')].filter(Boolean).join(',') }, addDays(today, -150)));
+    D.users.push(rec('users', { Email: 'rhea.lim@example.com', DisplayName: 'Rhea Lim', Role: ROLES.MANAGER, TeamLeadID: '', Active: 'TRUE', CampaignIDs: cid('Takahami') }, addDays(today, -150)));
 
     var first = ['Bea', 'Carlo', 'Dana', 'Elijah', 'Faye', 'Gino', 'Hazel', 'Ivan', 'Jasmine', 'Kevin', 'Lara', 'Miguel', 'Nina', 'Oscar', 'Paula', 'Quinn', 'Rina', 'Sam', 'Tess', 'Ulysses', 'Vina', 'Warren', 'Ysa', 'Zack'];
     var last = ['Aquino', 'Bernardo', 'Castillo', 'Dizon', 'Estrada', 'Flores', 'Garcia', 'Herrera', 'Ignacio', 'Javier', 'Lim', 'Morales', 'Navarro', 'Ocampo', 'Pascual', 'Quinto', 'Rivera', 'Salazar', 'Tan', 'Uy', 'Valdez', 'Yap', 'Zamora', 'Lopez'];
@@ -2192,6 +2266,7 @@ var AGSCore = (function () {
     improvementRows: improvementRows, monthlyReport: monthlyReport, campaignIssueReport: campaignIssueReport,
     operationalImpact: operationalImpact, csvCell: csvCell, toCsv: toCsv,
     handle: handle, resolveUser: resolveUser, publicUser: publicUser, generateSynthetic: generateSynthetic,
+    buildScope: buildScope, inScope: inScope, scopeData: scopeData, splitIds: splitIds,
     _systemContext: function (repo, user) { return makeCtx(repo, user, 'system-' + repo.uuid()); }
   };
 })();
@@ -2768,10 +2843,10 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
         var repo = S.demoT.repo, camps = C.byKey(repo.all('campaigns'), 'CampaignID'), tls = C.byKey(repo.all('teamLeads'), 'TeamLeadID');
         var rank = { ADMIN: 0, MANAGER: 1, QUALITY: 2, TEAM_LEAD: 3 };
         var users = S.demoT.users().filter(function (u) { return C.ASSIGNABLE_ROLES.indexOf(C.normRole(u.Role)) >= 0; }).sort(function (a, b) { var x = rank[C.normRole(a.Role)], y = rank[C.normRole(b.Role)]; return x !== y ? x - y : (a.DisplayName < b.DisplayName ? -1 : 1); });
-        var roleSub = { ADMIN: 'Admin, full access', MANAGER: 'Manager, all records and configuration', QUALITY: 'Quality, view and review' };
+        var roleSub = { ADMIN: 'Admin, all campaigns', MANAGER: 'Manager', QUALITY: 'Quality' };
         demoHtml = '<section class="login-card" aria-labelledby="demo-h"><h2 id="demo-h">Explore with synthetic data</h2><p class="muted small">Every person and number in the demo is invented. Demo changes stay in this browser and never reach Google Sheets. Choose who to act as:</p><div class="demo-users">' +
           users.map(function (u) {
-            var tl = tls[u.TeamLeadID], sub = roleSub[C.normRole(u.Role)] ? roleSub[C.normRole(u.Role)] : 'Team Lead' + (tl ? ', ' + String(tl.CampaignIDs).split(',').map(function (c) { return (camps[c.trim()] || {}).Name || c; }).join(', ') : '');
+            var tl = tls[u.TeamLeadID], sub = roleSub[C.normRole(u.Role)] ? roleSub[C.normRole(u.Role)] + (C.splitIds(u.CampaignIDs).length ? ': ' + C.splitIds(u.CampaignIDs).map(function (c) { return (camps[c] || {}).Name || c; }).join(', ') : '') : 'Team Lead, own team' + (tl ? ', ' + String(tl.CampaignIDs).split(',').map(function (c) { return (camps[c.trim()] || {}).Name || c; }).join(', ') : '');
             return '<button class="demo-user" data-act="demoLogin" data-email="' + esc(u.Email) + '"><span class="avatar">' + esc(initials(u.DisplayName)) + '</span><span>' + esc(u.DisplayName) + '<small>' + esc(sub) + '</small></span></button>';
           }).join('') + '</div><div class="row" style="margin-top:10px"><span class="small muted">Demo data generated for ' + esc(fmtDate(S.demoT.state.generatedFor)) + '.</span><button class="btn btn-sm btn-ghost" data-act="demoResetLogin">Reset demo data</button></div></section>';
       } catch (e) { demoHtml = '<div class="note bad">The demo could not start: ' + esc(e.message) + '</div>'; }
@@ -2851,7 +2926,9 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     $('#bell').setAttribute('aria-label', mine.length + ' high-priority items need attention');
     $('#page-title').textContent = TITLES[page];
     document.title = TITLES[page] + ' — AGS Coaching Hub';
+    var noScope = S.user && (S.user.role === 'MANAGER' || S.user.role === 'QUALITY') && !(S.user.campaignIds || []).length;
     try {
+      if (noScope) { $('#page').innerHTML = '<div class="note warn" role="alert" style="max-width:640px">No campaigns are assigned to your account yet, so there is nothing to show. Ask an Admin to assign your campaigns in Settings → Users and roles.</div>'; paintSync(); return; }
       var out = PAGES[page]();
       $('#page').innerHTML = typeof out === 'string' ? out : out.html;
       if (out && out.mount) out.mount();
@@ -3984,13 +4061,13 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       '<section class="panel">' + (list.length ? '<div class="table-wrap"><table class="t"><thead><tr><th>Template</th><th>Campaign</th><th>Category</th><th>Method</th><th class="num">Action items</th><th>Status</th><th></th></tr></thead><tbody>' + list.map(function (t) {
         var c = C.json(t.Content, {});
         return '<tr><td class="t-title">' + esc(t.Name) + synTag(t) + '</td><td>' + esc(campName(t.CampaignID)) + '</td><td>' + esc(t.Category || '—') + '</td><td>' + esc(c.CoachingMethod || '—') + '</td><td class="num">' + (c.ActionItems || []).length + '</td><td>' + sb(C.b(t.Active) ? 'Active' : 'Inactive') + '</td><td><div class="row" style="justify-content:flex-end">' +
-          (capCreate() && C.b(t.Active) ? '<button class="btn btn-sm" data-act="newCoaching" data-template="' + t.TemplateID + '">Use</button>' : '') + (isOM() ? '<button class="btn btn-sm" data-act="editTemplate" data-id="' + t.TemplateID + '">Edit</button>' : '') + '</div></td></tr>';
+          (capCreate() && C.b(t.Active) ? '<button class="btn btn-sm" data-act="newCoaching" data-template="' + t.TemplateID + '">Use</button>' : '') + (isOM() && (t.CampaignID !== 'ALL' || isAdmin()) ? '<button class="btn btn-sm" data-act="editTemplate" data-id="' + t.TemplateID + '">Edit</button>' : '') + '</div></td></tr>';
       }).join('') + '</tbody></table></div>' : emptyState('No templates', isOM() ? 'Create one to standardize common coaching conversations.' : 'Ask an Admin or Manager to add templates.')) + '</section>';
   };
   ACT.editTemplate = function (el) {
     var t = el.dataset.id ? S.data.templates.filter(function (x) { return x.TemplateID === el.dataset.id; })[0] : null, c = t ? C.json(t.Content, {}) : {};
     simpleForm({ title: t ? 'Edit template' : 'New template', size: 'lg', rec: t, idKey: 'TemplateID', action: 'saveTemplate', done: 'Template saved.', fields: [
-      { k: 'Name', label: 'Template name', req: true, max: 120 }, { k: 'CampaignID', label: 'Campaign', type: 'select', req: true, options: opts([['ALL', 'All campaigns']].concat(liveCamps().map(function (x) { return [x.CampaignID, x.Name]; })), t ? t.CampaignID : 'ALL') },
+      { k: 'Name', label: 'Template name', req: true, max: 120 }, { k: 'CampaignID', label: 'Campaign', type: 'select', req: true, options: opts((isAdmin() ? [['ALL', 'All campaigns']] : []).concat(liveCamps().map(function (x) { return [x.CampaignID, x.Name]; })), t ? t.CampaignID : (isAdmin() ? 'ALL' : '')) },
       { k: 'Category', label: 'Category', max: 100, hint: 'Must match a category of the selected campaign (leave blank for all-campaign templates).' }, { k: 'Active', label: 'Availability', type: 'bool', text: 'Active', def: true },
       { k: 'c_CoachingMethod', label: 'Coaching method', type: 'select', options: opts(C.METHODS, c.CoachingMethod || '', 'None') },
       { k: 'c_ExpectedStandard', label: 'What is expected (for observed-behaviour coaching)', type: 'textarea', value: c.ExpectedStandard || '', max: 1000 },
@@ -4018,7 +4095,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
         var kpis = S.data.kpis.filter(function (k) { return C.live(k) && k.CampaignID === c.CampaignID; });
         return [c.Name, { html: sb(c.Status) }, C.arr(c.Categories).join(', '), tls.map(function (t) { return t.FullName; }).join(', '), kpis.length, { html: '<button class="btn btn-sm" data-act="editCampaign" data-id="' + c.CampaignID + '">Edit</button>' }];
       });
-      return '<div class="page-head"><div><p>The starting categories come from the project brief and can be changed here. Team lead assignment is managed on each team lead\'s profile.</p></div><div class="actions"><button class="btn btn-primary" data-act="editCampaign">Add campaign</button></div></div><section class="panel">' + tbl(['Campaign', 'Status', 'Coaching categories', 'Assigned team leads', 'KPIs', ''], rows, [4]) + '</section>';
+      return '<div class="page-head"><div><p>The starting categories come from the project brief and can be changed here. Team lead assignment is managed on each team lead\'s profile.</p></div><div class="actions">' + (isAdmin() ? '<button class="btn btn-primary" data-act="editCampaign">Add campaign</button>' : '') + '</div></div><section class="panel">' + tbl(['Campaign', 'Status', 'Coaching categories', 'Assigned team leads', 'KPIs', ''], rows, [4]) + '</section>';
     },
     kpis: function (f) {
       var list = S.data.kpis.filter(function (k) { return C.live(k) && (!f.kpiCampaign || k.CampaignID === f.kpiCampaign); });
@@ -4028,9 +4105,11 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
         })) + '</section>';
     },
     users: function () {
-      return '<div class="page-head"><div><p>Only people listed here as active can sign in. Roles are enforced by the server. You cannot change your own role or access.</p></div><div class="actions"><button class="btn btn-primary" data-act="editUser">Add user</button></div></div><section class="panel">' +
-        tbl(['Email', 'Name', 'Role', 'Linked team lead profile', 'Active', ''], S.data.users.filter(C.live).map(function (u) {
-          return [u.Email + (u.Email === S.user.email ? ' (you)' : ''), u.DisplayName, C.ROLE_LABELS[u.Role] || u.Role, u.TeamLeadID ? tlName(u.TeamLeadID) : '—', C.b(u.Active) ? 'Yes' : 'No', { html: '<button class="btn btn-sm" data-act="editUser" data-id="' + u.UserID + '">Edit</button>' }];
+      return '<div class="page-head"><div><p>Only people listed here as active can sign in. Admins see everything; Managers and Quality see only the campaigns assigned here; Team Leads see only their own team. The server enforces this. You cannot change your own role or access.</p></div><div class="actions"><button class="btn btn-primary" data-act="editUser">Add user</button></div></div><section class="panel">' +
+        tbl(['Email', 'Name', 'Role', 'Sees', 'Linked team lead profile', 'Active', ''], S.data.users.filter(C.live).map(function (u) {
+          var r = C.normRole(u.Role), cids = C.splitIds(u.CampaignIDs);
+          var sees = r === 'ADMIN' ? 'All campaigns' : r === 'TEAM_LEAD' ? 'Own team' : (cids.length ? cids.map(campName).join(', ') : { html: '<span class="b bad">No campaigns assigned</span>' });
+          return [u.Email + (u.Email === S.user.email ? ' (you)' : ''), u.DisplayName, C.ROLE_LABELS[u.Role] || u.Role, sees, u.TeamLeadID ? tlName(u.TeamLeadID) : '—', C.b(u.Active) ? 'Yes' : 'No', { html: '<button class="btn btn-sm" data-act="editUser" data-id="' + u.UserID + '">Edit</button>' }];
         })) + '</section>';
     },
     rules: function () {
@@ -4111,9 +4190,11 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       { k: 'Email', label: 'Company Google account email', type: 'email', req: true, disabled: self }, { k: 'DisplayName', label: 'Display name', req: true, max: 120 },
       { k: 'Role', label: 'Role', type: 'select', req: true, disabled: self, options: opts(C.ASSIGNABLE_ROLES.map(function (r) { return [r, C.ROLE_LABELS[r]]; }), u ? C.normRole(u.Role) : C.ROLES.TL), hint: 'Admin: everything. Manager: all records and configuration, not users or settings. Team Lead: own records. Quality: view, export and review alerts.' },
       { k: 'TeamLeadID', label: 'Linked team lead profile', type: 'select', options: tlOpts(u ? u.TeamLeadID : '', 'None'), hint: 'Required for Team Leads; it decides which records they own. Leave as None for Quality.' },
+      { k: 'CampaignIDs', label: 'Campaigns this person can see (Managers and Quality)', type: 'checks', span: 'span2', hint: 'Admins always see all campaigns. Team Leads see only their own team, so leave this empty for them.',
+        options: liveCamps().map(function (c) { var on = u && C.splitIds(u.CampaignIDs).indexOf(c.CampaignID) >= 0; return '<label class="check"><input type="checkbox" value="' + esc(c.CampaignID) + '"' + (on ? ' checked' : '') + '> ' + esc(c.Name) + '</label>'; }).join('') },
       { k: 'Active', label: 'Access', type: 'bool', text: 'Active (can sign in)', def: true, disabled: self }],
       extra: self ? '<div class="note" style="margin-top:12px">Your own role, email and access can only be changed by another Admin.</div>' : '',
-      transform: function (r) { if (self) { delete r.Role; delete r.Active; delete r.Email; } } });
+      transform: function (r) { r.CampaignIDs = (r.CampaignIDs || []).join(','); if (self) { delete r.Role; delete r.Active; delete r.Email; } } });
   };
 
   // ================= sync panel, demo controls =================
