@@ -306,7 +306,9 @@ table.t .group-h th{background:var(--surface);border-bottom:0;font-size:11.5px;c
 .csec{border-top:1px solid var(--line-2);padding-top:16px;margin-top:18px}
 .csec:first-of-type{border-top:0;padding-top:0;margin-top:4px}
 .csec > h3{margin-bottom:12px}
-.item-row.simple{grid-template-columns:minmax(0,1fr) 160px 140px auto}
+.item-row.simple{grid-template-columns:minmax(0,1fr) 160px 140px 84px}
+.item-row.simple.nostatus{grid-template-columns:minmax(0,1fr) 160px 84px}
+.item-row.item-head{background:none;border:0;padding:0 8px;font-size:11.5px;font-weight:600;color:var(--muted);margin:4px 0 2px}
 .items-list{display:flex;flex-direction:column;gap:8px}
 .item-row{display:grid;grid-template-columns:minmax(0,2.4fr) minmax(0,1fr) 150px 140px auto;gap:8px;align-items:start;border:1px solid var(--line-2);border-radius:var(--radius-m);padding:8px;background:var(--surface-2)}
 .calc{display:flex;gap:10px;flex-wrap:wrap;align-items:center;background:var(--surface-2);border:1px dashed var(--line);border-radius:var(--radius-m);padding:9px 12px;font-size:13px}
@@ -397,6 +399,7 @@ table.t .group-h th{background:var(--surface);border-bottom:0;font-size:11.5px;c
   .fgrid .span2{grid-column:auto}
   .item-row{grid-template-columns:1fr 1fr}
   .item-row > :first-child{grid-column:1/-1}
+  .item-row.item-head{display:none}
   .topbar .hide-sm{display:none}
   .search .input{min-width:0;width:100%}
   .search{flex:1 1 100%;order:5}
@@ -730,6 +733,7 @@ var AGSCore = (function () {
     if (OPEN_PLAN.indexOf(plan.Status) >= 0 || !plan.Status) {
       var fus = idx.fusByPlan[plan.ActionPlanID] || [];
       for (var i = 0; i < fus.length; i++) if (fus[i].Status === 'Scheduled' && fus[i].DueDate && fus[i].DueDate < today) return 'Overdue';
+      if ((plan.Status || 'Not Started') === 'Not Started' && (idx.itemsByPlan[plan.ActionPlanID] || []).some(function (it) { return it.Status === 'In Progress' || it.Status === 'Done'; })) return 'In Progress';
     }
     return plan.Status || 'Not Started';
   }
@@ -1301,9 +1305,9 @@ var AGSCore = (function () {
     var scopeMemo = null;
     ctx.scope = function () { return scopeMemo || (scopeMemo = buildScope(repo, user)); };
     ctx.visible = function (entity, r) { return inScope(ctx.scope(), entity, r); };
-    ctx.get = function (entity, id, allowArchived) {
+    ctx.get = function (entity, id, allowArchived, internal) {
       var r = id ? repo.get(entity, id) : null;
-      if (r && entity !== 'users' && !ctx.visible(entity, r)) r = null;
+      if (r && !internal && entity !== 'users' && !ctx.visible(entity, r)) r = null;
       if (!r || (r.ArchivedAt && !allowArchived)) throw AgsError('NOT_FOUND', ENTITIES[entity].label + ' ' + s(id) + ' was not found or has been archived.');
       return r;
     };
@@ -1323,7 +1327,8 @@ var AGSCore = (function () {
     };
     ctx.update = function (entity, id, changes, expectedVersion, action, opts) {
       opts = opts || {};
-      var def = ENTITIES[entity], cur = ctx.get(entity, id, opts.allowArchived);
+      // Internal follow-on updates were already authorised by the action that triggered them.
+      var def = ENTITIES[entity], cur = ctx.get(entity, id, opts.allowArchived, opts.internal);
       if (!opts.internal) checkVersion(entity, cur, expectedVersion);
       var next = clone(cur), fields = [], det = {};
       Object.keys(changes).forEach(function (k) {
@@ -1489,6 +1494,19 @@ var AGSCore = (function () {
     ctx.insert('followUps', { CoachingID: se.CoachingID, ActionPlanID: plan.ActionPlanID, AgentID: se.AgentID, CampaignID: se.CampaignID,
       DueDate: plan.FollowUpDate, Status: 'Scheduled', ReviewingTeamLeadID: plan.ResponsibleTeamLeadID }, 'FOLLOWUP_SCHEDULED');
   }
+  // The plan follows its actions: Not Started until an action starts; back to Not Started only if every
+  // action is reset and no follow-up has been held. Follow-up stages are never changed here.
+  function syncPlanStatus(ctx, planId) {
+    var plan = ctx.find('plans', planId); if (!plan || plan.ArchivedAt) return;
+    var items = ctx.list('items', function (i) { return i.ActionPlanID === planId && i.Status !== 'Cancelled'; });
+    var started = items.some(function (i) { return i.Status === 'In Progress' || i.Status === 'Done'; });
+    if (plan.Status === 'Not Started' && started) {
+      ctx.update('plans', planId, { Status: 'In Progress' }, null, 'PLAN_STATUS_CHANGE', { internal: true, details: { reason: 'An action was started' } });
+    } else if (plan.Status === 'In Progress' && items.length && !started &&
+      !ctx.list('followUps', function (f) { return f.ActionPlanID === planId && (f.Status === 'Completed' || f.Status === 'Awaiting Evaluation'); }).length) {
+      ctx.update('plans', planId, { Status: 'Not Started' }, null, 'PLAN_STATUS_CHANGE', { internal: true, details: { reason: 'No action has started' } });
+    }
+  }
   function latestEvaluated(fus) {
     var done = fus.filter(function (f) { return f.Status === 'Completed' && f.Outcome && f.Outcome !== 'Inconclusive'; });
     done.sort(function (a, c) { return s(a.CompletedDate) < s(c.CompletedDate) ? -1 : s(a.CompletedDate) > s(c.CompletedDate) ? 1 : (a.FollowUpID < c.FollowUpID ? -1 : 1); });
@@ -1542,7 +1560,8 @@ var AGSCore = (function () {
       plan.CoachingID = se.CoachingID;
       var pr = ctx.insert('plans', plan);
       items.forEach(function (x) { x.merged.ActionPlanID = pr.ActionPlanID; x.merged.CoachingID = se.CoachingID; ctx.insert('items', x.merged); });
-      ensureFollowUp(ctx, se, pr);
+      syncPlanStatus(ctx, pr.ActionPlanID);
+      ensureFollowUp(ctx, se, ctx.find('plans', pr.ActionPlanID));
     }
   } };
 
@@ -1590,7 +1609,8 @@ var AGSCore = (function () {
         if (se.Status === 'Cancelled' && fu.Status === 'Scheduled') ctx.update('followUps', fu.FollowUpID, { Status: 'Cancelled', CancelReason: 'Coaching session cancelled' }, null, 'FOLLOWUP_CANCELLED', { internal: true });
         else if (fu.AgentID !== se.AgentID || fu.CampaignID !== se.CampaignID) ctx.update('followUps', fu.FollowUpID, { AgentID: se.AgentID, CampaignID: se.CampaignID }, null, 'UPDATE', { internal: true });
       });
-      ensureFollowUp(ctx, se, plan);
+      syncPlanStatus(ctx, plan.ActionPlanID);
+      ensureFollowUp(ctx, se, ctx.find('plans', plan.ActionPlanID));
     }
   } };
 
@@ -1642,9 +1662,7 @@ var AGSCore = (function () {
     if (ex) rec = ctx.update('items', ex.ActionItemID, f, p.expectedVersion);
     else { m.ActionPlanID = plan.ActionPlanID; m.CoachingID = plan.CoachingID; rec = ctx.insert('items', m); }
     ctx.primary = { entity: 'items', id: rec.ActionItemID };
-    if (plan.Status === 'Not Started' && (rec.Status === 'In Progress' || rec.Status === 'Done')) {
-      ctx.update('plans', plan.ActionPlanID, { Status: 'In Progress' }, null, 'PLAN_STATUS_CHANGE', { internal: true });
-    }
+    syncPlanStatus(ctx, plan.ActionPlanID);
   } };
 
   H.recordFollowUp = { write: true, fn: function (ctx, p) {
@@ -3099,12 +3117,12 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       fsel('sessions', 'teamLeadId', 'Team lead', tlOpts(f.teamLeadId, 'All', S.g.campaignId)) + fsel('sessions', 'agentId', 'Agent', agentOpts(S.g.campaignId, f.agentId, 'All')) +
       fsel('sessions', 'category', 'Category', opts(campCats(S.g.campaignId), f.category, 'All')) + fsel('sessions', 'status', 'Status', opts(C.COACHING_STATUSES, f.status, 'All')) +
       fsel('sessions', 'priority', 'Priority', opts(C.PRIORITIES, f.priority, 'All')) +
-      fsel('sessions', 'planStatus', 'Action plan', opts([['OPEN', 'Any open plan'], ['NONE', 'No plan']].concat(C.PLAN_STATUSES), f.planStatus, 'All')) +
+      fsel('sessions', 'planStatus', 'Plan status', opts([['OPEN', 'Any open plan'], ['NONE', 'No plan']].concat(C.PLAN_STATUSES), f.planStatus, 'All')) +
       fsel('sessions', 'outcome', 'Latest outcome', opts(C.OUTCOMES, f.outcome, 'All')) +
       (S.user.teamLeadId ? fcheck('sessions', 'mine', 'My records only', f.mine) : '') + fcheck('sessions', 'allDates', 'Ignore date range', f.allDates) +
       (isOM() ? fcheck('sessions', 'archived', 'Archived only', f.archived) : '') + '</div>';
     var table = rows.length ? '<div class="table-wrap"><table class="t"><thead><tr>' + sortTh('sessions', 'CoachingDate', 'Date / ID', f) + sortTh('sessions', 'agent', 'Agent', f) +
-      sortTh('sessions', 'Category', 'Category and title', f) + sortTh('sessions', 'tl', 'Team lead', f) + sortTh('sessions', 'Status', 'Status', f) + sortTh('sessions', 'planStatus', 'Action plan', f) +
+      sortTh('sessions', 'Category', 'Category and title', f) + sortTh('sessions', 'tl', 'Team lead', f) + sortTh('sessions', 'Status', 'Status', f) + sortTh('sessions', 'planStatus', 'Plan status', f) +
       sortTh('sessions', 'nextFU', 'Next follow-up', f) + sortTh('sessions', 'outcome', 'Latest outcome', f) + '</tr></thead><tbody>' +
       pageRows.map(function (x) {
         return '<tr class="click" tabindex="0" data-act="openSession" data-id="' + esc(x.CoachingID) + '"><td><div class="t-title">' + esc(fmtDate(x.CoachingDate)) + '</div><div class="t-sub">' + esc(x.CoachingID) + '</div></td>' +
@@ -3162,12 +3180,12 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       body += '<div class="sec"><div class="row"><h3 style="margin-right:auto">Action plan ' + esc(plan.ActionPlanID) + '</h3>' +
         (canPlan ? '<button class="btn btn-sm" data-act="planStatus" data-id="' + plan.ActionPlanID + '">Update plan</button><button class="btn btn-sm" data-act="addItem" data-id="' + plan.ActionPlanID + '">Add action item</button>' +
           (!openFu && C.isOpenPlan(plan.Status) && s.Status === 'Completed' ? '<button class="btn btn-sm" data-act="scheduleFu" data-id="' + plan.ActionPlanID + '">Schedule follow-up</button>' : '') : '') + '</div>' +
-        '<dl class="dl" style="margin-top:8px">' + dd('Status', sb(ps) + (plan.StatusNote ? '<div class="t-sub">' + esc(plan.StatusNote) + '</div>' : '')) + dd('Responsible team lead', esc(tlName(plan.ResponsibleTeamLeadID))) +
+        '<dl class="dl" style="margin-top:8px">' + dd('Plan status', sb(ps) + '<div class="t-sub">Updates automatically from the actions and follow-ups.</div>' + (plan.StatusNote ? '<div class="t-sub">' + esc(plan.StatusNote) + '</div>' : '')) + dd('Responsible team lead', esc(tlName(plan.ResponsibleTeamLeadID))) +
         dd('Target', esc((pk ? pk.Name + ': ' : '') + (target ? target + (pk ? ' ' + pk.Unit : '') : '') + (plan.TargetDirection ? ' (' + plan.TargetDirection + ')' : ''))) + dd('Baseline', esc(fmtNum(plan.BaselineValue, pk && pk.Unit))) +
         dd('Monitoring period', esc(fmtDate(plan.MonitoringStart) + ' to ' + fmtDate(plan.MonitoringEnd))) + dd('Next follow-up', plan.FollowUpDate ? esc(fmtDate(plan.FollowUpDate)) : '') +
         dd('Expected improvement', txt(plan.ExpectedImprovement), true) + dd('Support required', txt(plan.SupportRequired), true) + '</dl>' +
         '<h4 style="margin:12px 0 6px;font-size:.92rem">Action items <span class="muted small">(' + done + ' of ' + active + ' done)</span></h4>' +
-        (k.items.length ? '<div class="table-wrap"><table class="t"><thead><tr><th>Item</th><th>Owner</th><th>Deadline</th><th>Status</th></tr></thead><tbody>' + k.items.map(function (it) {
+        (k.items.length ? '<div class="table-wrap"><table class="t"><thead><tr><th>Action</th><th>Owner</th><th>Deadline</th><th>Action status</th></tr></thead><tbody>' + k.items.map(function (it) {
           var late = it.Deadline && it.Deadline < S.today && it.Status !== 'Done' && it.Status !== 'Cancelled';
           return '<tr><td>' + esc(it.Description) + (it.Notes ? '<div class="t-sub">' + esc(it.Notes) + '</div>' : '') + '</td><td>' + esc(it.Owner || '—') + '</td><td class="tabular">' + esc(fmtDate(it.Deadline)) + (late ? ' <span class="b bad">Past deadline</span>' : '') + '</td><td>' +
             (canPlan && it.Status !== 'Cancelled' ? '<label class="sr-only" for="it-' + it.ActionItemID + '">Status for ' + esc(it.Description) + '</label><select id="it-' + it.ActionItemID + '" class="input input-sm" data-change="itemStatus" data-id="' + it.ActionItemID + '" data-coaching="' + esc(id) + '">' + opts(C.ITEM_STATUSES, it.Status) + '</select>' : sb(it.Status)) + '</td></tr>';
@@ -3365,14 +3383,18 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       : '<input' + a + ' type="' + (o.type || 'text') + '" value="' + esc(v) + '"' + (o.type === 'number' ? ' step="any" inputmode="decimal"' : '') + (o.max ? ' maxlength="' + o.max + '"' : '') + (o.ph ? ' placeholder="' + esc(o.ph) + '"' : '') + '>';
     return '<div class="' + (o.span || '') + '"' + (o.wrapId ? ' id="' + o.wrapId + '"' : '') + (o.hidden ? ' hidden' : '') + '><label class="lbl" data-lvl="' + (o.lvl || '') + '" for="' + id + '">' + esc(o.label) + '</label>' + input + (o.hint ? '<div class="hint" id="' + id + '-h">' + o.hint + '</div>' : '') + '<div class="err" id="' + id + '-e" hidden></div></div>';
   }
-  function itemRow(it, i) {
+  function itemRow(it, i, showStatus) {
     it = it || {}; var locked = it.Status === 'Cancelled' && it.ActionItemID;
-    return '<div class="item-row simple" data-id="' + esc(it.ActionItemID || '') + '" data-v="' + esc(it.RecordVersion || '') + '">' +
+    return '<div class="item-row simple' + (showStatus ? '' : ' nostatus') + '" data-id="' + esc(it.ActionItemID || '') + '" data-v="' + esc(it.RecordVersion || '') + '">' +
       '<div><label class="sr-only" for="it-d-' + i + '">Action</label><input id="it-d-' + i + '" class="input" data-i="Description" placeholder="What will the agent do?" maxlength="1000" value="' + esc(it.Description || '') + '"' + (locked ? ' disabled' : '') + '><div class="err" data-ierr="Description" hidden></div></div>' +
-      '<div><label class="sr-only" for="it-dl-' + i + '">Deadline</label><input id="it-dl-' + i + '" type="date" class="input" data-i="Deadline" title="Deadline (optional)" value="' + esc(it.Deadline || '') + '"><div class="err" data-ierr="Deadline" hidden></div></div>' +
-      '<div><label class="sr-only" for="it-s-' + i + '">Status</label><select id="it-s-' + i + '" class="input" data-i="Status">' + opts(C.ITEM_STATUSES, it.Status || 'Not Started') + '</select></div>' +
+      '<div><label class="sr-only" for="it-dl-' + i + '">Deadline (optional)</label><input id="it-dl-' + i + '" type="date" class="input" data-i="Deadline" value="' + esc(it.Deadline || '') + '"><div class="err" data-ierr="Deadline" hidden></div></div>' +
+      (showStatus ? '<div><label class="sr-only" for="it-s-' + i + '">Action status</label><select id="it-s-' + i + '" class="input" data-i="Status">' + opts(C.ITEM_STATUSES, it.Status || 'Not Started') + '</select></div>' : '') +
       '<button class="btn btn-sm btn-ghost" data-act="removeItem" aria-label="Remove action">' + (it.ActionItemID ? 'Cancel' : 'Remove') + '</button></div>';
   }
+  function itemHead(showStatus) {
+    return '<div class="item-row simple item-head' + (showStatus ? '' : ' nostatus') + '" aria-hidden="true"><span>Action</span><span>Deadline (optional)</span>' + (showStatus ? '<span>Action status</span>' : '') + '<span></span></div>';
+  }
+
   function campKpis(cid) { return S.data.kpis.filter(function (k) { return C.live(k) && k.CampaignID === cid && C.b(k.Active); }); }
   function unitSfx(k) { return k && k.Unit ? (k.Unit === '%' ? '%' : ' ' + k.Unit) : ''; }
   // Describes how far a KPI result is from its target, in the KPI's own direction.
@@ -3451,8 +3473,9 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
 
       '<section class="csec"><h3>5. Action plan and follow-up</h3><div class="err" id="fld-plan-e" hidden></div>' +
       (planClosed ? '<div class="note" style="margin-bottom:10px">This plan is ' + esc(k.plan.Status) + '. Reopen it from the record view to change its status.</div>' : '') +
-      '<span class="lbl" data-lvl="completed">Actions the agent will take</span><div class="items-list" id="items">' + items.map(itemRow).join('') + '</div><div class="err" id="fld-items-e" hidden></div>' +
+      '<span class="lbl" data-lvl="completed">Actions the agent will take</span>' + itemHead(!!id) + '<div class="items-list" id="items">' + items.map(function (it, i) { return itemRow(it, i, !!id); }).join('') + '</div><div class="err" id="fld-items-e" hidden></div>' +
       '<button class="btn btn-sm" style="margin-top:8px" data-act="addItemRow">Add another action</button>' +
+      (id ? '<div class="hint">Set each action\'s status as the agent progresses. The plan status updates automatically.</div>' : '') +
       '<div class="fgrid three" style="margin-top:14px">' +
       fld({ f: 'plan.TargetValue', label: 'Target at follow-up', type: 'number', value: tv, wrapId: 'w-tv', hint: '<span id="tv-hint">Taken from the KPI; change it if you agreed a step target.</span>' }) +
       fld({ f: 'plan.TargetMin', label: 'Target range minimum', type: 'number', value: tmin, wrapId: 'w-tmin' }) +
@@ -3547,12 +3570,12 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     $('input[name=gapmode][value="' + d.mode + '"]', m).checked = true;
     Object.keys(d.f).forEach(function (k) { if (k === 'coaching.CampaignID') return; var el = $('[data-f="' + k + '"]', m); if (!el || el.disabled) return; if (el.type === 'checkbox') el.checked = !!d.f[k]; else el.value = d.f[k]; });
     $$('input[name=rc]', m).forEach(function (x) { x.checked = d.rc.indexOf(x.value) >= 0; });
-    $('#items', m).innerHTML = (d.items.length ? d.items : [{}]).map(itemRow).join('');
+    $('#items', m).innerHTML = (d.items.length ? d.items : [{}]).map(function (it, i) { return itemRow(it, i, !!m._form.id); }).join('');
     modeUI(m); reqUI(m); $('#w-cancel', m).hidden = fv(m, 'coaching.Status') !== 'Cancelled';
   }
   ACT.restoreDraft = function (el) { var m = el.closest('.modal-backdrop'), d = lsGet(draftKey(m._form.id), null); if (d) { restoreSnapshot(m, d.data); m._form.dirty = true; } el.closest('.note').remove(); toast('Draft restored. It is still not saved to the server.', 'warn'); };
   ACT.discardDraft = function (el) { var m = el.closest('.modal-backdrop'); lsDel(draftKey(m._form.id)); el.closest('.note').remove(); };
-  ACT.addItemRow = function (el) { var box = el.closest('.modal').querySelector('#items'); box.insertAdjacentHTML('beforeend', itemRow({}, 'n' + Date.now())); box.lastElementChild.querySelector('input').focus(); el.closest('.modal-backdrop')._form.dirty = true; };
+  ACT.addItemRow = function (el) { var box = el.closest('.modal').querySelector('#items'); box.insertAdjacentHTML('beforeend', itemRow({}, 'n' + Date.now(), !!el.closest('.modal-backdrop')._form.id)); box.lastElementChild.querySelector('input').focus(); el.closest('.modal-backdrop')._form.dirty = true; };
   ACT.removeItem = function (el) {
     var row = el.closest('.item-row');
     if (row.dataset.id) { row.querySelector('[data-i=Status]').value = 'Cancelled'; row.querySelector('[data-i=Description]').disabled = true; el.disabled = true; }
@@ -3571,7 +3594,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     var box = $('#items', m);
     (c.ActionItems || []).forEach(function (txt2) {
       var empty = $$('.item-row', box).filter(function (r) { return !r.dataset.id && !r.querySelector('[data-i=Description]').value; })[0];
-      if (empty) empty.querySelector('[data-i=Description]').value = txt2; else box.insertAdjacentHTML('beforeend', itemRow({ Description: txt2 }, 't' + Math.random().toString(36).slice(2, 7)));
+      if (empty) empty.querySelector('[data-i=Description]').value = txt2; else box.insertAdjacentHTML('beforeend', itemRow({ Description: txt2 }, 't' + Math.random().toString(36).slice(2, 7), !!m._form.id));
       filled++;
     });
     m._form.templateId = tid; m._form.dirty = true;
@@ -3849,7 +3872,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
         lineChart(pts, { label: kp.Name + ' measurements', target: kp.TargetDirection === 'Within Range' ? null : kp.TargetValue, min: kp.TargetDirection === 'Within Range' ? kp.TargetMin : null, max: kp.TargetMax }) +
         '<div class="table-wrap"><table class="t"><thead><tr><th>Date</th><th class="num">Value</th><th>Type</th><th>Source</th></tr></thead><tbody>' + pts.map(function (p2) { return '<tr><td class="tabular">' + esc(fmtDate(p2.x)) + '</td><td class="num">' + esc(fmtNum(p2.y, kp.Unit)) + '</td><td>' + (p2.kind === 'baseline' ? 'Before coaching' : 'At follow-up') + '</td><td>' + esc(p2.source) + '</td></tr>'; }).join('') + '</tbody></table></div></div>';
     }).join('') + '<p class="small muted">Only values recorded in coaching sessions and follow-ups are shown. Nothing is estimated or interpolated.</p>' : '<p class="muted">No KPI measurements have been recorded for this agent.</p>';
-    var planHtml = plans.length ? '<div class="table-wrap"><table class="t"><thead><tr><th>Plan</th><th>Commitments</th><th>Responsible</th><th>Status</th><th>Progress</th><th>Latest follow-up</th></tr></thead><tbody>' + plans.map(function (p) {
+    var planHtml = plans.length ? '<div class="table-wrap"><table class="t"><thead><tr><th>Plan</th><th>Commitments</th><th>Responsible</th><th>Plan status</th><th>Progress</th><th>Latest follow-up</th></tr></thead><tbody>' + plans.map(function (p) {
       var it = S.idx.itemsByPlan[p.ActionPlanID] || [], act = it.filter(function (i) { return i.Status !== 'Cancelled'; }), dn = act.filter(function (i) { return i.Status === 'Done'; }).length, lo = C.latestOutcome(p, S.idx, false);
       var next = act.filter(function (i) { return i.Status !== 'Done' && i.Deadline; }).map(function (i) { return i.Deadline; }).sort()[0];
       return '<tr class="click" tabindex="0" data-act="openSession" data-id="' + esc(p.CoachingID) + '"><td>' + esc(p.ActionPlanID) + '<div class="t-sub">' + esc(p.CoachingID) + '</div></td><td>' + esc(act.map(function (i) { return i.Description; }).join('; ') || '—') + (next ? '<div class="t-sub">Next deadline ' + esc(fmtDate(next)) + '</div>' : '') + '</td><td>' + esc(tlName(p.ResponsibleTeamLeadID)) + '</td><td>' + sb(C.planStatus(p, S.idx, S.today)) + '</td><td><div class="minibar" title="' + dn + ' of ' + act.length + ' items done"><span style="width:' + (act.length ? dn / act.length * 100 : 0) + '%"></span></div><span class="t-sub">' + dn + ' of ' + act.length + '</span></td><td>' + (lo ? sb(lo.Outcome) + '<div class="t-sub">' + esc(fmtDate(lo.CompletedDate)) + '</div>' : '<span class="muted">—</span>') + '</td></tr>';
