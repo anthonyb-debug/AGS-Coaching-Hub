@@ -436,8 +436,12 @@ var AGSCore = (function () {
   // ------------------------------------------------------------------
   // Enumerations
   // ------------------------------------------------------------------
-  var ROLES = { TL: 'TEAM_LEAD', OM: 'OPS_MANAGER' };
-  var ROLE_LABELS = { TEAM_LEAD: 'Team Lead', OPS_MANAGER: 'Operations Manager' };
+  // OM is the legacy "Operations Manager" code from version 1.0; such users are treated as ADMIN.
+  var ROLES = { ADMIN: 'ADMIN', MANAGER: 'MANAGER', TL: 'TEAM_LEAD', QUALITY: 'QUALITY', OM: 'OPS_MANAGER' };
+  var ROLE_LABELS = { ADMIN: 'Admin', MANAGER: 'Manager', TEAM_LEAD: 'Team Lead', QUALITY: 'Quality', OPS_MANAGER: 'Admin' };
+  var ASSIGNABLE_ROLES = ['ADMIN', 'MANAGER', 'TEAM_LEAD', 'QUALITY'];
+  function normRole(r) { return r === 'OPS_MANAGER' ? 'ADMIN' : r; }
+  function isAdminRole(r) { return normRole(r) === 'ADMIN'; }
   var COACHING_STATUSES = ['Draft', 'Scheduled', 'Completed', 'Cancelled'];
   var PLAN_STATUSES = ['Not Started', 'In Progress', 'Pending Follow-up', 'Overdue', 'Resolved', 'Closed — Target Not Met'];
   var OPEN_PLAN = ['Not Started', 'In Progress', 'Pending Follow-up', 'Overdue'];
@@ -596,7 +600,7 @@ var AGSCore = (function () {
     kpis: { CampaignID: ID, Name: T(100), Description: T(1000), Unit: T(30), TargetValue: N, TargetMin: N, TargetMax: N,
       TargetDirection: E(DIRECTIONS), EvaluationPeriod: T(60), Active: B },
     templates: { CampaignID: { t: 'id', allow: ['ALL'] }, Name: T(120), Category: T(100), Content: J, Active: B },
-    users: { Email: T(200), DisplayName: T(120), Role: E([ROLES.TL, ROLES.OM]), TeamLeadID: ID, Active: B },
+    users: { Email: T(200), DisplayName: T(120), Role: E(ASSIGNABLE_ROLES), TeamLeadID: ID, Active: B },
     development: { AgentID: ID, SkillArea: T(150), Objective: T(1000), RecommendedTraining: T(1000), ProgressNotes: T(4000),
       TargetDate: D, Status: E(DEV_STATUSES) }
   };
@@ -633,18 +637,22 @@ var AGSCore = (function () {
   // ------------------------------------------------------------------
   // Permissions (authoritative copy runs on the server)
   // ------------------------------------------------------------------
-  function isOM(u) { return !!u && u.role === ROLES.OM; }
+  // isOM = supervisor (Admin or Manager): may create and edit any coaching record and manage roster/configuration.
+  function isOM(u) { return !!u && (u.role === ROLES.ADMIN || u.role === ROLES.MANAGER); }
+  function isAdmin(u) { return !!u && u.role === ROLES.ADMIN; }
+  function isQuality(u) { return !!u && u.role === ROLES.QUALITY; }
   function ownsTL(u, tlId) { return !!u && !!u.teamLeadId && !!tlId && u.teamLeadId === tlId; }
   function canEditSession(u, sess) { return isOM(u) || ownsTL(u, sess.TeamLeadID); }
   function canManagePlan(u, plan, sess) { return isOM(u) || ownsTL(u, plan.ResponsibleTeamLeadID) || (!!sess && ownsTL(u, sess.TeamLeadID)); }
   function canRecordFollowUp(u, fu, plan, sess) { return canManagePlan(u, plan, sess) || ownsTL(u, fu.ReviewingTeamLeadID); }
   function canEditDevelopment(u, d, agent) { return isOM(u) || (d && d.CreatedBy === u.email) || (!!agent && ownsTL(u, agent.TeamLeadID)); }
-  function canReviewAlert(u, agent) { return isOM(u) || (!!agent && ownsTL(u, agent.TeamLeadID)); }
+  function canReviewAlert(u, agent) { return isOM(u) || isQuality(u) || (!!agent && ownsTL(u, agent.TeamLeadID)); }
   function capabilities(u) {
-    var om = isOM(u);
-    return { createCoaching: om || !!(u && u.teamLeadId), manageConfig: om, manageUsers: om, viewAudit: om, archive: om,
-      manageRoster: om, manageSync: om, export: !!u, viewSettings: om, editTemplates: om };
+    var om = isOM(u), adm = isAdmin(u);
+    return { createCoaching: om || (!!u && u.role === ROLES.TL && !!u.teamLeadId), manageConfig: om, manageUsers: adm, viewAudit: adm, archive: om,
+      manageRoster: om, manageSync: adm, export: !!u, viewSettings: om, editTemplates: om, manageSettings: adm, reviewAllAlerts: om || isQuality(u) };
   }
+
 
   // ------------------------------------------------------------------
   // Category normalization
@@ -1305,8 +1313,11 @@ var AGSCore = (function () {
     var e = s(email).toLowerCase().trim();
     var u = (usersList || []).filter(function (r) { return live(r) && s(r.Email).toLowerCase().trim() === e; })[0];
     if (!u || !b(u.Active)) return null;
-    return { email: e, role: u.Role, teamLeadId: s(u.TeamLeadID), displayName: u.DisplayName || e, userId: u.UserID, active: true };
+    var role = normRole(u.Role);
+    if (ASSIGNABLE_ROLES.indexOf(role) < 0) return null;
+    return { email: e, role: role, teamLeadId: role === ROLES.QUALITY ? '' : s(u.TeamLeadID), displayName: u.DisplayName || e, userId: u.UserID, active: true };
   }
+
   function publicUser(u) {
     return { email: u.email, role: u.role, roleLabel: ROLE_LABELS[u.role] || u.role, teamLeadId: u.teamLeadId, displayName: u.displayName, userId: u.userId, capabilities: capabilities(u) };
   }
@@ -1342,7 +1353,7 @@ var AGSCore = (function () {
     var merged = Object.assign({}, existing || {}, p);
     merged.AgentID = se.AgentID; merged.CampaignID = se.CampaignID;
     if (!merged.ResponsibleTeamLeadID) merged.ResponsibleTeamLeadID = se.TeamLeadID;
-    if (existing && p.ResponsibleTeamLeadID && p.ResponsibleTeamLeadID !== existing.ResponsibleTeamLeadID && !isOM(ctx.user)) errors['plan.ResponsibleTeamLeadID'] = 'Only an Operations Manager can reassign plan responsibility.';
+    if (existing && p.ResponsibleTeamLeadID && p.ResponsibleTeamLeadID !== existing.ResponsibleTeamLeadID && !isOM(ctx.user)) errors['plan.ResponsibleTeamLeadID'] = 'Only an Admin or Manager can reassign plan responsibility.';
     if (!merged.Status) merged.Status = 'Not Started';
     if (merged.ResponsibleTeamLeadID) { var tl = ctx.find('teamLeads', merged.ResponsibleTeamLeadID); if (!tl || tl.ArchivedAt) errors['plan.ResponsibleTeamLeadID'] = 'Select an existing team lead.'; }
     if (merged.TargetKPIID) {
@@ -1410,14 +1421,15 @@ var AGSCore = (function () {
   H.bootstrap = { fn: function (ctx, p) {
     var inclArch = isOM(ctx.user) && !!p.includeArchived, out = {};
     DATA_ENTITIES.forEach(function (e) { out[e] = ctx.repo.all(e).filter(function (r) { return inclArch || live(r); }); });
-    out.users = isOM(ctx.user) ? ctx.repo.all('users') : ctx.repo.all('users').filter(function (r) { return s(r.Email).toLowerCase() === ctx.user.email; });
+    out.users = isAdmin(ctx.user) ? ctx.repo.all('users') : ctx.repo.all('users').filter(function (r) { return s(r.Email).toLowerCase() === ctx.user.email; });
     out.settings = ctx.settings; out.user = publicUser(ctx.user); out.serverTime = ctx.now; out.today = ctx.today; out.coreVersion = CORE_VERSION;
     return out;
   } };
 
   H.createCoaching = { write: true, fn: function (ctx, p) {
     var u = ctx.user, errors = {};
-    if (!isOM(u) && !u.teamLeadId) forbid('Your account is not linked to a team lead profile, so you cannot create coaching records. Ask an Operations Manager to link it.');
+    if (isQuality(u)) forbid('The Quality role can view and review records but cannot create coaching records.');
+    if (!isOM(u) && !u.teamLeadId) forbid('Your account is not linked to a team lead profile, so you cannot create coaching records. Ask an Admin to link it.');
     var c = sanitize('sessions', p.coaching, errors, 'coaching.');
     if (!isOM(u)) {
       if (c.TeamLeadID && c.TeamLeadID !== u.teamLeadId) forbid('Team leads can create coaching records only under their own name.');
@@ -1450,8 +1462,8 @@ var AGSCore = (function () {
     if (!canEditSession(u, cur)) forbid('You can edit only coaching records assigned to you. This record belongs to another team lead.');
     checkVersion('sessions', cur, p.expectedVersion);
     var c = sanitize('sessions', p.coaching, errors, 'coaching.');
-    if (!isOM(u) && c.TeamLeadID && c.TeamLeadID !== cur.TeamLeadID) forbid('Only an Operations Manager can reassign a coaching record to another team lead.');
-    if (cur.Status === 'Cancelled' && c.Status && c.Status !== 'Cancelled' && !isOM(u)) forbid('Only an Operations Manager can reopen a cancelled coaching record.');
+    if (!isOM(u) && c.TeamLeadID && c.TeamLeadID !== cur.TeamLeadID) forbid('Only an Admin or Manager can reassign a coaching record to another team lead.');
+    if (cur.Status === 'Cancelled' && c.Status && c.Status !== 'Cancelled' && !isOM(u)) forbid('Only an Admin or Manager can reopen a cancelled coaching record.');
     if (cur.Status === 'Completed' && (c.Status === 'Draft' || c.Status === 'Scheduled') && !isOM(u)) errors['coaching.Status'] = 'A completed session cannot return to Draft or Scheduled.';
     var m = Object.assign({}, cur, c);
     if (!('Title' in (p.coaching || {})) && (!cur.Title || (c.Category && c.Category !== cur.Category) || ('RelatedKPIID' in c && c.RelatedKPIID !== cur.RelatedKPIID))) {
@@ -1499,7 +1511,7 @@ var AGSCore = (function () {
     var c = sanitize('plans', p.changes, errors, 'plan.');
     var fus = ctx.list('followUps', function (x) { return x.ActionPlanID === plan.ActionPlanID; });
     var items = ctx.list('items', function (i) { return i.ActionPlanID === plan.ActionPlanID; });
-    if (c.ResponsibleTeamLeadID && c.ResponsibleTeamLeadID !== plan.ResponsibleTeamLeadID && !isOM(u)) forbid('Only an Operations Manager can reassign plan responsibility.');
+    if (c.ResponsibleTeamLeadID && c.ResponsibleTeamLeadID !== plan.ResponsibleTeamLeadID && !isOM(u)) forbid('Only an Admin or Manager can reassign plan responsibility.');
     if (c.Status && c.Status !== plan.Status) {
       if (c.Status === 'Overdue') errors['plan.Status'] = 'Overdue is calculated automatically from follow-up dates.';
       if (c.Status === 'Resolved') { var lo = latestEvaluated(fus); if (!lo || lo.Outcome !== 'Target Achieved') errors['plan.Status'] = 'Mark a plan Resolved only after a follow-up records "Target Achieved".'; }
@@ -1532,7 +1544,7 @@ var AGSCore = (function () {
     var m = Object.assign({ Status: 'Not Started' }, ex || {}, f);
     if (!s(m.Description)) errors['item.Description'] = 'Describe the action item.';
     if (m.Deadline && m.Deadline < se.CoachingDate) errors['item.Deadline'] = 'Deadline is before the coaching date.';
-    if (ex && ex.Status === 'Cancelled' && f.Status && f.Status !== 'Cancelled' && !isOM(u)) errors['item.Status'] = 'Only an Operations Manager can reopen a cancelled action item.';
+    if (ex && ex.Status === 'Cancelled' && f.Status && f.Status !== 'Cancelled' && !isOM(u)) errors['item.Status'] = 'Only an Admin or Manager can reopen a cancelled action item.';
     failIf(errors);
     var rec;
     if (ex) rec = ctx.update('items', ex.ActionItemID, f, p.expectedVersion);
@@ -1549,7 +1561,7 @@ var AGSCore = (function () {
     if (!canRecordFollowUp(u, fu, plan, se)) forbid('You can record follow-ups only for coaching records you own or plans assigned to you.');
     checkVersion('followUps', fu, p.expectedVersion);
     if (fu.Status === 'Cancelled') throw AgsError('VALIDATION', 'This follow-up was cancelled and cannot be recorded.');
-    if (fu.Status === 'Completed' && !isOM(u)) throw AgsError('VALIDATION', 'This follow-up is already completed. An Operations Manager can amend it.');
+    if (fu.Status === 'Completed' && !isOM(u)) throw AgsError('VALIDATION', 'This follow-up is already completed. An Admin or Manager can amend it.');
     var finalize = p.finalize !== false;
     var c = sanitize('followUps', p.followUp, errors, 'followUp.');
     var m = Object.assign({}, fu, c);
@@ -1603,7 +1615,7 @@ var AGSCore = (function () {
     if (!isIsoDate(p.dueDate)) errors.dueDate = 'Enter a valid date.';
     else if (p.dueDate < se.CoachingDate) errors.dueDate = 'The follow-up date is before the coaching date.';
     var rev = s(p.reviewingTeamLeadId) || plan.ResponsibleTeamLeadID;
-    if (rev !== plan.ResponsibleTeamLeadID && !isOM(u)) forbid('Only an Operations Manager can assign a different reviewer.');
+    if (rev !== plan.ResponsibleTeamLeadID && !isOM(u)) forbid('Only an Admin or Manager can assign a different reviewer.');
     if (rev && !ctx.find('teamLeads', rev)) errors.reviewingTeamLeadId = 'Select an existing team lead.';
     failIf(errors);
     var open = ctx.list('followUps', function (x) { return x.ActionPlanID === plan.ActionPlanID && (x.Status === 'Scheduled' || x.Status === 'Awaiting Evaluation'); })[0];
@@ -1755,7 +1767,7 @@ var AGSCore = (function () {
       if (c.CoachingMethod && METHODS.indexOf(c.CoachingMethod) < 0) e.Content = 'Coaching method is not a valid option.';
     });
   } };
-  H.saveUser = { write: true, om: true, fn: function (ctx, p) {
+  H.saveUser = { write: true, admin: true, fn: function (ctx, p) {
     saveEntity(ctx, 'users', p, function (m, e, ex, f) {
       if (f.Email) m.Email = f.Email = f.Email.toLowerCase();
       if (!s(m.Active)) m.Active = f.Active = 'TRUE';
@@ -1763,18 +1775,19 @@ var AGSCore = (function () {
       if (m.Email && !isEmail(m.Email)) e.Email = 'Enter a valid email address.';
       else if (m.Email && !uniqueAmong(ctx, 'users', 'Email', m.Email, ex && ex.UserID, true)) e.Email = 'This email already has a user record.';
       if (m.Role === ROLES.TL && !m.TeamLeadID) e.TeamLeadID = 'Link the team lead profile for this user.';
+      if (m.Role === ROLES.QUALITY && m.TeamLeadID) e.TeamLeadID = 'Quality users are not linked to a team lead profile. Choose "None".';
       if (m.TeamLeadID && !ctx.find('teamLeads', m.TeamLeadID)) e.TeamLeadID = 'Select an existing team lead.';
       var self = ex && s(ex.Email).toLowerCase() === ctx.user.email;
-      if (self && ((f.Role && f.Role !== ex.Role) || (f.Active && f.Active !== ex.Active) || (f.Email && f.Email !== s(ex.Email).toLowerCase()))) forbid('You cannot change your own role, access or sign-in email. Ask another Operations Manager.');
-      if (ex && ex.Role === ROLES.OM && b(ex.Active) && (m.Role !== ROLES.OM || !b(m.Active))) {
-        var others = ctx.list('users', function (r) { return r.UserID !== ex.UserID && r.Role === ROLES.OM && b(r.Active); });
-        if (!others.length) e.Role = 'At least one active Operations Manager is required.';
+      if (self && ((f.Role && f.Role !== ex.Role) || (f.Active && f.Active !== ex.Active) || (f.Email && f.Email !== s(ex.Email).toLowerCase()))) forbid('You cannot change your own role, access or sign-in email. Ask another Admin.');
+      if (ex && isAdminRole(ex.Role) && b(ex.Active) && (!isAdminRole(m.Role) || !b(m.Active))) {
+        var others = ctx.list('users', function (r) { return r.UserID !== ex.UserID && isAdminRole(r.Role) && b(r.Active); });
+        if (!others.length) e.Role = 'At least one active Admin is required.';
       }
     });
   } };
   H.saveDevelopment = { write: true, fn: function (ctx, p) {
     var u = ctx.user, raw = p.record || {};
-    if (!isOM(u) && !u.teamLeadId) forbid('Your account is not linked to a team lead profile.');
+    if (isQuality(u) || (!isOM(u) && !u.teamLeadId)) forbid('Your role cannot add or edit development items.');
     var ex = raw.DevelopmentID ? ctx.get('development', raw.DevelopmentID) : null;
     var agent = ctx.find('agents', ex ? ex.AgentID : raw.AgentID);
     if (ex && !canEditDevelopment(u, ex, agent)) forbid('You can edit development items you created or for agents assigned to you.');
@@ -1800,7 +1813,7 @@ var AGSCore = (function () {
   ['AdminMinutesSavedPerRecord', 'HourlyCostRate'].forEach(function (k) {
     SETTING_RULES[k] = function (v) { return v === '' || (n(v) !== null && n(v) >= 0) ? '' : 'Enter a non-negative number or leave blank.'; };
   });
-  H.saveSettings = { write: true, om: true, fn: function (ctx, p) {
+  H.saveSettings = { write: true, admin: true, fn: function (ctx, p) {
     var ch = p.changes || {}, errors = {}, cur = ctx.settings, clean = {};
     Object.keys(ch).forEach(function (k) {
       if (!SETTING_RULES[k]) { errors[k] = 'Unknown setting.'; return; }
@@ -1817,7 +1830,7 @@ var AGSCore = (function () {
   } };
   H.reviewAlert = { write: true, fn: function (ctx, p) {
     var agent = ctx.get('agents', p.agentId), errors = {};
-    if (!canReviewAlert(ctx.user, agent)) forbid('Only the agent\'s assigned team lead or an Operations Manager can review this alert.');
+    if (!canReviewAlert(ctx.user, agent)) forbid('Only the agent\'s assigned team lead, a Manager, an Admin or Quality can review this alert.');
     var key = s(p.alertKey), ids = Array.isArray(p.coachingIds) ? p.coachingIds.map(s) : [];
     if (!/^RI\|/.test(key) || key.length > 3000) errors.alertKey = 'Invalid alert reference.';
     if (!ids.length || ids.length > 60) errors.coachingIds = 'The alert has no contributing records.';
@@ -1832,8 +1845,8 @@ var AGSCore = (function () {
   } };
 
   // ---------- logs, analytics, exports, recovery ----------
-  H.getAuditLog = { om: true, fn: function (ctx, p) { return { rows: ctx.repo.readLog('AuditLog', { limit: Math.min(+p.limit || 200, 1000), entityId: s(p.entityId), actor: s(p.actor).toLowerCase(), action: s(p.action) }) }; } };
-  H.getSyncLog = { om: true, fn: function (ctx, p) { return { rows: ctx.repo.readLog('SyncLog', { limit: Math.min(+p.limit || 200, 1000), status: s(p.status) }) }; } };
+  H.getAuditLog = { admin: true, fn: function (ctx, p) { return { rows: ctx.repo.readLog('AuditLog', { limit: Math.min(+p.limit || 200, 1000), entityId: s(p.entityId), actor: s(p.actor).toLowerCase(), action: s(p.action) }) }; } };
+  H.getSyncLog = { admin: true, fn: function (ctx, p) { return { rows: ctx.repo.readLog('SyncLog', { limit: Math.min(+p.limit || 200, 1000), status: s(p.status) }) }; } };
   H.getChangeHistory = { fn: function (ctx, p) {
     if (DATA_ENTITIES.indexOf(p.entity) < 0) throw AgsError('VALIDATION', 'Unknown record type.');
     ctx.get(p.entity, p.id, isOM(ctx.user));
@@ -1855,7 +1868,7 @@ var AGSCore = (function () {
     ctx.audit('EXPORT', 'report', s(p.report).replace(CTRL_RE, '').slice(0, 80) || 'export', [], { rowCount: +p.rowCount || 0, filters: safe });
     return { primary: { entity: 'report', id: s(p.report).slice(0, 80) }, changed: {} };
   } };
-  H.createBackup = { write: true, om: true, fn: function (ctx) {
+  H.createBackup = { write: true, admin: true, fn: function (ctx) {
     var r = ctx.repo.createBackup(ctx.now);
     ctx.audit('BACKUP', 'spreadsheet', r.name, [], { name: r.name });
     return { primary: { entity: 'backup', id: r.name }, changed: {}, backup: r };
@@ -1865,7 +1878,8 @@ var AGSCore = (function () {
     var h = Object.prototype.hasOwnProperty.call(H, action) ? H[action] : null;
     if (!h) throw AgsError('NOT_FOUND', 'Unknown action: ' + s(action).slice(0, 40));
     if (!user || !user.active) throw AgsError('FORBIDDEN', 'Your account is inactive or not registered for AGS Coaching Hub.');
-    if (h.om && !isOM(user)) throw AgsError('FORBIDDEN', 'This action requires the Operations Manager role.');
+    if (h.admin && !isAdmin(user)) throw AgsError('FORBIDDEN', 'This action requires the Admin role.');
+    if (h.om && !isOM(user)) throw AgsError('FORBIDDEN', 'This action requires the Admin or Manager role.');
     payload = payload && typeof payload === 'object' ? payload : {};
     if (!h.write) return h.fn(makeCtx(repo, user, ''), payload);
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(s(requestId))) throw AgsError('VALIDATION', 'A valid request ID is required for write operations.');
@@ -1943,8 +1957,9 @@ var AGSCore = (function () {
         return t;
       });
     });
-    D.users.unshift(rec('users', { Email: 'celeste.navarro@example.com', DisplayName: 'Celeste Navarro', Role: ROLES.OM, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
-    D.users.push(rec('users', { Email: 'dominic.reyes@example.com', DisplayName: 'Dominic Reyes', Role: ROLES.OM, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
+    D.users.unshift(rec('users', { Email: 'celeste.navarro@example.com', DisplayName: 'Celeste Navarro', Role: ROLES.ADMIN, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
+    D.users.push(rec('users', { Email: 'lea.fernandez@example.com', DisplayName: 'Lea Fernandez', Role: ROLES.QUALITY, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
+    D.users.push(rec('users', { Email: 'dominic.reyes@example.com', DisplayName: 'Dominic Reyes', Role: ROLES.MANAGER, TeamLeadID: '', Active: 'TRUE' }, addDays(today, -150)));
 
     var first = ['Bea', 'Carlo', 'Dana', 'Elijah', 'Faye', 'Gino', 'Hazel', 'Ivan', 'Jasmine', 'Kevin', 'Lara', 'Miguel', 'Nina', 'Oscar', 'Paula', 'Quinn', 'Rina', 'Sam', 'Tess', 'Ulysses', 'Vina', 'Warren', 'Ysa', 'Zack'];
     var last = ['Aquino', 'Bernardo', 'Castillo', 'Dizon', 'Estrada', 'Flores', 'Garcia', 'Herrera', 'Ignacio', 'Javier', 'Lim', 'Morales', 'Navarro', 'Ocampo', 'Pascual', 'Quinto', 'Rivera', 'Salazar', 'Tan', 'Uy', 'Valdez', 'Yap', 'Zamora', 'Lopez'];
@@ -2125,7 +2140,7 @@ var AGSCore = (function () {
   }
 
   return {
-    CORE_VERSION: CORE_VERSION, ROLES: ROLES, ROLE_LABELS: ROLE_LABELS, COACHING_STATUSES: COACHING_STATUSES, PLAN_STATUSES: PLAN_STATUSES,
+    CORE_VERSION: CORE_VERSION, ROLES: ROLES, ROLE_LABELS: ROLE_LABELS, ASSIGNABLE_ROLES: ASSIGNABLE_ROLES, normRole: normRole, isAdminRole: isAdminRole, isAdmin: isAdmin, isQuality: isQuality, COACHING_STATUSES: COACHING_STATUSES, PLAN_STATUSES: PLAN_STATUSES,
     OPEN_PLAN: OPEN_PLAN, CLOSED_PLAN: CLOSED_PLAN, PLAN_DECISIONS: PLAN_DECISIONS, ITEM_STATUSES: ITEM_STATUSES, FU_STATUSES: FU_STATUSES,
     OUTCOMES: OUTCOMES, ROOT_CAUSES: ROOT_CAUSES, METHODS: METHODS, PRIORITIES: PRIORITIES, SOURCES: SOURCES, DIRECTIONS: DIRECTIONS,
     GAP_TYPES: GAP_TYPES, DEV_STATUSES: DEV_STATUSES, ACTIVE_STATUSES: ACTIVE_STATUSES, ALERT_OUTCOMES: ALERT_OUTCOMES,
@@ -2279,7 +2294,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     S.data = { settings: d.settings || {} };
     C.DATA_ENTITIES.concat(['users']).forEach(function (e) { S.data[e] = d[e] || []; });
     S.settings = C.settingsWithDefaults(d.settings || {});
-    if (d.user) S.user = d.user;
+    if (d.user) { S.user = d.user; S.user.role = C.normRole(S.user.role); S.user.roleLabel = C.ROLE_LABELS[S.user.role] || S.user.roleLabel; }
     S.today = d.today || todayTz();
     reindex();
   }
@@ -2293,7 +2308,9 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     if (cid) return C.arr((S.idx.camps[cid] || {}).Categories);
     var all = []; liveCamps().forEach(function (c) { C.arr(c.Categories).forEach(function (x) { if (all.indexOf(x) < 0) all.push(x); }); }); return all.sort();
   }
-  function isOM() { return S.user && S.user.role === C.ROLES.OM; }
+  // Admin or Manager: can edit any record and manage roster/configuration (the server enforces this too).
+  function isOM() { return !!S.user && (S.user.role === C.ROLES.ADMIN || S.user.role === C.ROLES.MANAGER); }
+  function isAdmin() { return !!S.user && S.user.role === C.ROLES.ADMIN; }
   function me() { return { email: S.user.email, role: S.user.role, teamLeadId: S.user.teamLeadId }; }
 
   // ---------------- badges ----------------
@@ -2684,10 +2701,12 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       try {
         S.demoT = S.demoT || new DemoTransport();
         var repo = S.demoT.repo, camps = C.byKey(repo.all('campaigns'), 'CampaignID'), tls = C.byKey(repo.all('teamLeads'), 'TeamLeadID');
-        var users = S.demoT.users().sort(function (a, b) { return a.Role === b.Role ? (a.DisplayName < b.DisplayName ? -1 : 1) : (a.Role === C.ROLES.OM ? -1 : 1); });
+        var rank = { ADMIN: 0, MANAGER: 1, QUALITY: 2, TEAM_LEAD: 3 };
+        var users = S.demoT.users().filter(function (u) { return C.ASSIGNABLE_ROLES.indexOf(C.normRole(u.Role)) >= 0; }).sort(function (a, b) { var x = rank[C.normRole(a.Role)], y = rank[C.normRole(b.Role)]; return x !== y ? x - y : (a.DisplayName < b.DisplayName ? -1 : 1); });
+        var roleSub = { ADMIN: 'Admin, full access', MANAGER: 'Manager, all records and configuration', QUALITY: 'Quality, view and review' };
         demoHtml = '<section class="login-card" aria-labelledby="demo-h"><h2 id="demo-h">Explore with synthetic data</h2><p class="muted small">Every person and number in the demo is invented. Demo changes stay in this browser and never reach Google Sheets. Choose who to act as:</p><div class="demo-users">' +
           users.map(function (u) {
-            var tl = tls[u.TeamLeadID], sub = u.Role === C.ROLES.OM ? 'Operations Manager, all campaigns' : 'Team Lead' + (tl ? ', ' + String(tl.CampaignIDs).split(',').map(function (c) { return (camps[c.trim()] || {}).Name || c; }).join(', ') : '');
+            var tl = tls[u.TeamLeadID], sub = roleSub[C.normRole(u.Role)] ? roleSub[C.normRole(u.Role)] : 'Team Lead' + (tl ? ', ' + String(tl.CampaignIDs).split(',').map(function (c) { return (camps[c.trim()] || {}).Name || c; }).join(', ') : '');
             return '<button class="demo-user" data-act="demoLogin" data-email="' + esc(u.Email) + '"><span class="avatar">' + esc(initials(u.DisplayName)) + '</span><span>' + esc(u.DisplayName) + '<small>' + esc(sub) + '</small></span></button>';
           }).join('') + '</div><div class="row" style="margin-top:10px"><span class="small muted">Demo data generated for ' + esc(fmtDate(S.demoT.state.generatedFor)) + '.</span><button class="btn btn-sm btn-ghost" data-act="demoResetLogin">Reset demo data</button></div></section>';
       } catch (e) { demoHtml = '<div class="note bad">The demo could not start: ' + esc(e.message) + '</div>'; }
@@ -3056,7 +3075,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   };
   ACT.archiveSession = function (el) {
     var s = findSession(el.dataset.id);
-    confirmDialog({ title: 'Archive ' + s.CoachingID + '?', message: 'Archiving hides the record, its action plan, items and follow-ups from normal views and reports. Nothing is deleted, and an Operations Manager can restore it. The reason is kept in the audit log.', reason: true, reasonLabel: 'Reason for archiving', ok: 'Archive record', danger: true })
+    confirmDialog({ title: 'Archive ' + s.CoachingID + '?', message: 'Archiving hides the record, its action plan, items and follow-ups from normal views and reports. Nothing is deleted, and an Admin or Manager can restore it. The reason is kept in the audit log.', reason: true, reasonLabel: 'Reason for archiving', ok: 'Archive record', danger: true })
       .then(function (r) {
         if (!r) return;
         Api.write('archiveRecord', { entity: 'sessions', id: s.CoachingID, expectedVersion: s.RecordVersion, reason: r.reason }, 'Archive ' + s.CoachingID)
@@ -3302,7 +3321,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   function modeUI(m) {
     var kpiMode = gapMode(m) === 'kpi', c = fv(m, 'coaching.CampaignID'), k = S.idx.kpis[fv(m, 'coaching.RelatedKPIID')];
     $('#g-kpi', m).hidden = !kpiMode; $('#g-obs', m).hidden = kpiMode;
-    var none = $('#kpi-none', m); none.textContent = kpiMode && c && !campKpis(c).length ? 'No KPIs are set up for this campaign yet. Use "Observed behaviour", or ask an Operations Manager to add one.' : (k ? 'Target ' + kpiTargetText(k) + ', ' + k.TargetDirection.toLowerCase() + '.' : '');
+    var none = $('#kpi-none', m); none.textContent = kpiMode && c && !campKpis(c).length ? 'No KPIs are set up for this campaign yet. Use "Observed behaviour", or ask an Admin or Manager to add one.' : (k ? 'Target ' + kpiTargetText(k) + ', ' + k.TargetDirection.toLowerCase() + '.' : '');
     $('#unit-hint', m).textContent = k ? 'In ' + k.Unit + '.' : '';
     var range = kpiMode && k && k.TargetDirection === 'Within Range', single = kpiMode && k && (k.TargetDirection === 'Higher Is Better' || k.TargetDirection === 'Lower Is Better');
     $('#w-tv', m).hidden = !single; $('#w-tmin', m).hidden = !range; $('#w-tmax', m).hidden = !range;
@@ -3825,7 +3844,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     impact: function (filt) {
       var r = C.operationalImpact(S.data, filt, S.today, S.settings), rows = [];
       var html = '<div class="grid g-2"><section class="panel"><div class="panel-h"><h2>Repeated issues</h2></div><div class="panel-b">' + (r.repeated ? '<p><strong>' + r.repeated.current + '</strong> agent-category patterns meeting the recurring rule in ' + esc(r.repeated.currentPeriod) + ', compared with <strong>' + r.repeated.previous + '</strong> in the previous period (' + esc(r.repeated.previousPeriod) + ').</p>' : '<p class="muted">Choose a bounded date range to compare periods.</p>') + '</div></section>' +
-        '<section class="panel"><div class="panel-h"><h2>Administrative time and cost</h2></div><div class="panel-b">' + (r.timeSaved ? '<p>Estimated <strong>' + r.timeSaved.hours + ' hours</strong> saved (' + r.timeSaved.records + ' completed records × ' + r.timeSaved.minutesPerRecord + ' minutes).</p>' + (r.costSaved ? '<p>Estimated cost avoided: <strong>' + esc(r.costSaved.currency) + ' ' + r.costSaved.amount.toLocaleString('en-US') + '</strong> at ' + r.costSaved.hourlyRate + ' per hour.</p>' : '') + '<p class="small muted">Methodology: ' + esc(r.timeSaved.methodology) + '</p>' : '<p class="muted">Not calculated. An Operations Manager must configure the time assumption and a documented methodology in Settings first.</p>') + '</div></section></div>' +
+        '<section class="panel"><div class="panel-h"><h2>Administrative time and cost</h2></div><div class="panel-b">' + (r.timeSaved ? '<p>Estimated <strong>' + r.timeSaved.hours + ' hours</strong> saved (' + r.timeSaved.records + ' completed records × ' + r.timeSaved.minutesPerRecord + ' minutes).</p>' + (r.costSaved ? '<p>Estimated cost avoided: <strong>' + esc(r.costSaved.currency) + ' ' + r.costSaved.amount.toLocaleString('en-US') + '</strong> at ' + r.costSaved.hourlyRate + ' per hour.</p>' : '') + '<p class="small muted">Methodology: ' + esc(r.timeSaved.methodology) + '</p>' : '<p class="muted">Not calculated. An Admin must configure the time assumption and a documented methodology in Settings first.</p>') + '</div></section></div>' +
         '<section class="panel" style="margin-top:16px"><div class="panel-h"><h2>KPI changes after coaching</h2><span class="sub">Average absolute improvement across cases with both a baseline and a follow-up measurement.</span></div>' +
         tbl(['KPI', 'Unit', 'Cases with measurements', 'Average improvement', 'Target met'], r.kpiImprovements.map(function (k) { rows.push([k.kpi, k.unit, k.cases, k.avgImprovement, C.fmtRate(k.targetMet)]); return [k.kpi, k.unit, k.cases, k.avgImprovement, C.fmtRate(k.targetMet)]; }), [2, 3, 4]) + '</section>' +
         '<div class="note" style="margin-top:12px">' + r.notes.map(esc).join('<br>') + '</div>';
@@ -3836,12 +3855,12 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   // ================= templates =================
   PAGES.templates = function () {
     var list = S.data.templates.filter(function (t) { return C.live(t) && (!S.g.campaignId || t.CampaignID === 'ALL' || t.CampaignID === S.g.campaignId); });
-    return '<div class="page-head"><div><p>Templates pre-fill empty fields in a new coaching record. Team leads can use them; Operations Managers maintain them.</p></div><div class="actions">' + (isOM() ? '<button class="btn btn-primary" data-act="editTemplate">New template</button>' : '') + '</div></div>' +
+    return '<div class="page-head"><div><p>Templates pre-fill empty fields in a new coaching record. Team leads, Managers and Admins can use them; Admins and Managers maintain them.</p></div><div class="actions">' + (isOM() ? '<button class="btn btn-primary" data-act="editTemplate">New template</button>' : '') + '</div></div>' +
       '<section class="panel">' + (list.length ? '<div class="table-wrap"><table class="t"><thead><tr><th>Template</th><th>Campaign</th><th>Category</th><th>Method</th><th class="num">Action items</th><th>Status</th><th></th></tr></thead><tbody>' + list.map(function (t) {
         var c = C.json(t.Content, {});
         return '<tr><td class="t-title">' + esc(t.Name) + synTag(t) + '</td><td>' + esc(campName(t.CampaignID)) + '</td><td>' + esc(t.Category || '—') + '</td><td>' + esc(c.CoachingMethod || '—') + '</td><td class="num">' + (c.ActionItems || []).length + '</td><td>' + sb(C.b(t.Active) ? 'Active' : 'Inactive') + '</td><td><div class="row" style="justify-content:flex-end">' +
           (capCreate() && C.b(t.Active) ? '<button class="btn btn-sm" data-act="newCoaching" data-template="' + t.TemplateID + '">Use</button>' : '') + (isOM() ? '<button class="btn btn-sm" data-act="editTemplate" data-id="' + t.TemplateID + '">Edit</button>' : '') + '</div></td></tr>';
-      }).join('') + '</tbody></table></div>' : emptyState('No templates', isOM() ? 'Create one to standardize common coaching conversations.' : 'Ask an Operations Manager to add templates.')) + '</section>';
+      }).join('') + '</tbody></table></div>' : emptyState('No templates', isOM() ? 'Create one to standardize common coaching conversations.' : 'Ask an Admin or Manager to add templates.')) + '</section>';
   };
   ACT.editTemplate = function (el) {
     var t = el.dataset.id ? S.data.templates.filter(function (x) { return x.TemplateID === el.dataset.id; })[0] : null, c = t ? C.json(t.Content, {}) : {};
@@ -3858,11 +3877,13 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       } });
   };
 
-  // ================= settings (Operations Managers) =================
-  var SET_TABS = [['campaigns', 'Campaigns'], ['kpis', 'KPI targets'], ['users', 'Users and roles'], ['rules', 'Rules and settings'], ['audit', 'Audit log'], ['sync', 'Sync and recovery']];
+  // ================= settings (Admins; Managers see campaigns and KPIs) =================
+  var SET_TABS = [['campaigns', 'Campaigns'], ['kpis', 'KPI targets'], ['users', 'Users and roles', true], ['rules', 'Rules and settings', true], ['audit', 'Audit log', true], ['sync', 'Sync and recovery', true]];
   PAGES.settings = function () {
     var f = pf('settings', { tab: 'campaigns', kpiCampaign: '' });
-    return '<div class="tabs" role="tablist">' + SET_TABS.map(function (t) { return '<button role="tab" aria-selected="' + (f.tab === t[0]) + '" data-act="setTab" data-tab="' + t[0] + '">' + esc(t[1]) + '</button>'; }).join('') + '</div>' + SETTINGS[f.tab](f);
+    var tabs = SET_TABS.filter(function (t) { return !t[2] || isAdmin(); });
+    if (!tabs.some(function (t) { return t[0] === f.tab; })) f.tab = 'campaigns';
+    return '<div class="tabs" role="tablist">' + tabs.map(function (t) { return '<button role="tab" aria-selected="' + (f.tab === t[0]) + '" data-act="setTab" data-tab="' + t[0] + '">' + esc(t[1]) + '</button>'; }).join('') + '</div>' + SETTINGS[f.tab](f);
   };
   ACT.setTab = function (el) { S.f.settings.tab = el.dataset.tab; render(); };
   var SETTINGS = {
@@ -3876,7 +3897,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     },
     kpis: function (f) {
       var list = S.data.kpis.filter(function (k) { return C.live(k) && (!f.kpiCampaign || k.CampaignID === f.kpiCampaign); });
-      return '<div class="page-head"><div><p>Targets are configured per campaign by Operations Managers. ' + (S.mode === 'demo' ? 'Demo targets are synthetic examples, not approved AGS targets.' : 'Enter only approved targets.') + '</p></div><div class="actions"><button class="btn btn-primary" data-act="editKpi">Add KPI</button></div></div>' +
+      return '<div class="page-head"><div><p>Targets are configured per campaign by Admins and Managers. ' + (S.mode === 'demo' ? 'Demo targets are synthetic examples, not approved AGS targets.' : 'Enter only approved targets.') + '</p></div><div class="actions"><button class="btn btn-primary" data-act="editKpi">Add KPI</button></div></div>' +
         '<div class="filters">' + fsel('settings', 'kpiCampaign', 'Campaign', campOpts(f.kpiCampaign, 'All')) + '</div><section class="panel">' + tbl(['KPI', 'Campaign', 'Unit', 'Direction', 'Target', 'Evaluation period', 'Active', ''], list.map(function (k) {
           return [{ html: esc(k.Name) + synTag(k) + '<div class="t-sub">' + esc(k.Description) + '</div>' }, campName(k.CampaignID), k.Unit, k.TargetDirection, kpiTargetText(k), k.EvaluationPeriod, C.b(k.Active) ? 'Yes' : 'No', { html: '<button class="btn btn-sm" data-act="editKpi" data-id="' + k.KPIID + '">Edit</button>' }];
         })) + '</section>';
@@ -3963,10 +3984,10 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
     var u = el.dataset.id ? S.data.users.filter(function (x) { return x.UserID === el.dataset.id; })[0] : null, self = u && u.Email === S.user.email;
     simpleForm({ title: u ? 'Edit user' : 'Add user', rec: u, idKey: 'UserID', action: 'saveUser', done: 'User saved.', fields: [
       { k: 'Email', label: 'Company Google account email', type: 'email', req: true, disabled: self }, { k: 'DisplayName', label: 'Display name', req: true, max: 120 },
-      { k: 'Role', label: 'Role', type: 'select', req: true, disabled: self, options: opts([[C.ROLES.TL, 'Team Lead'], [C.ROLES.OM, 'Operations Manager']], u ? u.Role : C.ROLES.TL) },
-      { k: 'TeamLeadID', label: 'Linked team lead profile', type: 'select', options: tlOpts(u ? u.TeamLeadID : '', 'None'), hint: 'Required for Team Leads; it decides which records they own.' },
+      { k: 'Role', label: 'Role', type: 'select', req: true, disabled: self, options: opts(C.ASSIGNABLE_ROLES.map(function (r) { return [r, C.ROLE_LABELS[r]]; }), u ? C.normRole(u.Role) : C.ROLES.TL), hint: 'Admin: everything. Manager: all records and configuration, not users or settings. Team Lead: own records. Quality: view, export and review alerts.' },
+      { k: 'TeamLeadID', label: 'Linked team lead profile', type: 'select', options: tlOpts(u ? u.TeamLeadID : '', 'None'), hint: 'Required for Team Leads; it decides which records they own. Leave as None for Quality.' },
       { k: 'Active', label: 'Access', type: 'bool', text: 'Active (can sign in)', def: true, disabled: self }],
-      extra: self ? '<div class="note" style="margin-top:12px">Your own role, email and access can only be changed by another Operations Manager.</div>' : '',
+      extra: self ? '<div class="note" style="margin-top:12px">Your own role, email and access can only be changed by another Admin.</div>' : '',
       transform: function (r) { if (self) { delete r.Role; delete r.Active; delete r.Email; } } });
   };
 
@@ -3981,7 +4002,7 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   }
   ACT.openSyncPanel = function () {
     openModal({ title: 'Synchronization', size: 'lg', body: syncSummary() + (S.mode === 'demo' ? '<div class="sec"><h3>Demo controls</h3><p class="small muted">These help you test failure handling. They exist only in the demo.</p><label class="check"><input type="checkbox" data-change="demoOffline"' + (S.demoOffline ? ' checked' : '') + '> Simulate network failure (saves go to the pending queue)</label><div class="row" style="margin-top:10px"><button class="btn btn-sm" data-act="demoDownload">Download demo data (JSON)</button><button class="btn btn-sm btn-danger" data-act="demoReset">Reset demo data</button></div></div>' : '') +
-      (isOM() && S.mode !== 'demo' ? '<div class="sec"><a href="#/settings" data-act="goSyncSettings">Open sync log and backups</a></div>' : ''), foot: '<button class="btn" data-act="closeModal">Close</button>' });
+      (isAdmin() && S.mode !== 'demo' ? '<div class="sec"><a href="#/settings" data-act="goSyncSettings">Open sync log and backups</a></div>' : ''), foot: '<button class="btn" data-act="closeModal">Close</button>' });
   };
   ACT.goSyncSettings = function () { closeAllModals(); pf('settings', { tab: 'sync' }).tab = 'sync'; go('settings'); };
   ACT.retryPending = function () { closeAllModals(); retryPending(); };
