@@ -406,6 +406,40 @@ table.t .group-h th{background:var(--surface);border-bottom:0;font-size:11.5px;c
   .modal-f{border-radius:0}
 }
 @media print{.sidebar,.topbar,.demo-banner,.filters,.btn,.modal-f{display:none!important}.shell{display:block}.content{overflow:visible}}
+@page{size:A4;margin:12mm}
+/* ---------- printable coaching form (one A4 page) ---------- */
+#print-root{display:none}
+#print-root.measure{display:block;position:absolute;left:-10000px;top:0;visibility:hidden}
+@media print{
+  html.printing-form body > *:not(#print-root){display:none!important}
+  html.printing-form #print-root{display:block!important;position:static;visibility:visible}
+  html.printing-form,html.printing-form body{height:auto!important;background:#fff!important;padding:0!important}
+}
+.pf{width:186mm;font-family:var(--font);font-size:9.5pt;line-height:1.38;color:#111;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+.pf-head{display:flex;align-items:center;gap:10px;border-bottom:1.5px solid #1F3354;padding-bottom:6px;margin-bottom:8px}
+.pf-head img{width:13mm;height:auto}
+.pf-head h1{font-size:15pt;margin:0;color:#1F3354}
+.pf-head .pf-org{font-size:8.5pt;color:#444}
+.pf-head .pf-meta{margin-left:auto;text-align:right;font-size:8.5pt;color:#333}
+.pf-head .pf-meta b{font-size:10pt;color:#111}
+.pf-draft{display:inline-block;border:1px solid #9A630E;color:#9A630E;font-weight:700;font-size:8pt;padding:0 5px;margin-left:6px}
+.pf h2{font-size:10pt;margin:9px 0 4px;color:#1F3354;border-bottom:1px solid #C9D1DC;padding-bottom:2px}
+.pf-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px 12px}
+.pf-grid.two{grid-template-columns:repeat(2,1fr)}
+.pf-f{min-width:0}
+.pf-f span{display:block;font-size:7.5pt;color:#555;font-weight:600}
+.pf-f div{white-space:pre-wrap;overflow-wrap:anywhere}
+.pf-wide{grid-column:1/-1}
+.pf table{width:100%;border-collapse:collapse;font-size:9pt}
+.pf th{text-align:left;font-size:7.5pt;color:#555;border-bottom:1px solid #999;padding:2px 4px}
+.pf td{border-bottom:1px solid #ddd;padding:3px 4px;vertical-align:top}
+.pf-checks{display:flex;flex-wrap:wrap;gap:2px 14px}
+.pf-sign{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
+.pf-sign .line{border-bottom:1px solid #222;height:9mm;margin-bottom:2px}
+.pf-sign .lbl{font-size:7.5pt;color:#555}
+.pf-sign .row{display:grid;grid-template-columns:2fr 1fr;gap:10px}
+.pf-foot{margin-top:10px;border-top:1px solid #C9D1DC;padding-top:4px;font-size:7.5pt;color:#555;display:flex;justify-content:space-between}
+.pf-more{font-size:8pt;color:#555;font-style:italic}
 </style>
 </head>
 <body>
@@ -2697,9 +2731,10 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
   }
   function kpiTargetText(k) {
     if (!k) return '';
-    if (k.TargetDirection === 'Within Range') return k.TargetMin + '–' + k.TargetMax + ' ' + k.Unit;
+    var u = k.Unit === '%' ? '%' : ' ' + k.Unit;
+    if (k.TargetDirection === 'Within Range') return k.TargetMin + '–' + k.TargetMax + u;
     if (k.TargetDirection === 'Qualitative Evaluation') return 'Qualitative';
-    return (k.TargetDirection === 'Lower Is Better' ? '≤ ' : '≥ ') + k.TargetValue + ' ' + k.Unit;
+    return (k.TargetDirection === 'Lower Is Better' ? '≤ ' : '≥ ') + k.TargetValue + u;
   }
   function pf(page, defaults) { if (!S.f[page]) S.f[page] = Object.assign({}, defaults); else Object.keys(defaults).forEach(function (k) { if (!(k in S.f[page])) S.f[page][k] = defaults[k]; }); return S.f[page]; }
   function fsel(page, key, label, optionsHtml) { var id = 'pf-' + page + '-' + key; return '<div class="f"><label for="' + id + '">' + esc(label) + '</label><select id="' + id + '" class="input input-sm" data-change="pf" data-page="' + page + '" data-key="' + key + '">' + optionsHtml + '</select></div>'; }
@@ -3076,9 +3111,69 @@ if (typeof module !== 'undefined' && module.exports) { module.exports = MemoryRe
       (S.mode === 'demo' && !s.ArchivedAt ? '<button class="btn btn-sm btn-ghost" data-act="simConflict" data-id="' + esc(id) + '" title="Demo only">Simulate a colleague\'s edit</button>' : '') +
       (isOM() && !s.ArchivedAt ? '<button class="btn btn-danger" data-act="archiveSession" data-id="' + esc(id) + '">Archive</button>' : '') +
       (isOM() && s.ArchivedAt ? '<button class="btn" data-act="restoreSession" data-id="' + esc(id) + '">Restore</button>' : '') +
+      '<button class="btn" data-act="printRecord" data-id="' + esc(id) + '">Print coaching form</button>' +
       (canEdit ? '<button class="btn btn-primary" data-act="editCoaching" data-id="' + esc(id) + '">Edit record</button>' : '') + '<button class="btn" data-act="closeModal">Close</button>';
     openModal({ title: esc(s.Title || 'Coaching record'), sub: esc(s.CoachingID + ', ' + agName(s.AgentID) + ', ' + fmtDate(s.CoachingDate)), body: body, foot: foot, size: 'lg' });
   }
+  // ---------------- printable coaching form (single A4 page) ----------------
+  var PRINT_MAX_MM = 266, PX_PER_MM = 96 / 25.4, PRINT_MIN_ZOOM = 0.72;
+  function logoDataUrl() { var el = $('.brand-mark'); if (!el) return ''; var m = /url\("?(data:image\/[^")]+)"?\)/.exec(getComputedStyle(el).backgroundImage || ''); return m ? m[1] : ''; }
+  function clip(v, limit, id) { v = String(v || ''); return v.length > limit ? v.slice(0, limit).replace(/\s+\S*$/, '') + '… (continued in the app, record ' + id + ')' : v; }
+  function printFormHtml(s, limit) {
+    var k = sessionKids(s.CoachingID), plan = k.plan, a = ag(s.AgentID), kp = S.idx.kpis[s.RelatedKPIID], L = function (v) { return esc(clip(v, limit, s.CoachingID)); };
+    var f = function (label, val, cls) { return '<div class="pf-f ' + (cls || '') + '"><span>' + esc(label) + '</span><div>' + (val === '' || val === null || val === undefined ? '—' : val) + '</div></div>'; };
+    var gap;
+    if (s.GapType === 'Numeric' && kp) {
+      var g = gapInfo(kp, s.ActualValue, plan ? plan.TargetValue || kp.TargetValue : kp.TargetValue, plan ? plan.TargetMin : kp.TargetMin, plan ? plan.TargetMax : kp.TargetMax);
+      gap = '<div class="pf-grid">' + f('KPI', esc(kp.Name)) + f('Current result', esc(fmtNum(s.ActualValue, kp.Unit))) + f('Target', esc(kpiTargetText(kp))) +
+        f('Gap to target', esc(g ? g.text : (s.PerformanceGap || '')), 'pf-wide') + (s.SupportingEvidence ? f('Evidence reference', L(s.SupportingEvidence), 'pf-wide') : '') + '</div>';
+    } else {
+      gap = '<div class="pf-grid two">' + f('What was observed', L(s.ActualPerformance)) + f('What is expected', L(s.ExpectedStandard)) + (s.GapDescription ? f('Gap description', L(s.GapDescription), 'pf-wide') : '') + '</div>';
+    }
+    var rc = C.arr(s.RootCauses);
+    var items = k.items.filter(function (i) { return i.Status !== 'Cancelled'; }), shown = items.slice(0, 8);
+    var target = !plan ? '' : plan.TargetDirection === 'Qualitative Evaluation' || !plan.TargetDirection ? 'Meet the expected standard (qualitative)'
+      : plan.TargetDirection === 'Within Range' ? plan.TargetMin + '–' + plan.TargetMax + (kp ? ' ' + kp.Unit : '') : (plan.TargetDirection === 'Lower Is Better' ? '≤ ' : '≥ ') + plan.TargetValue + (kp ? (kp.Unit === '%' ? '%' : ' ' + kp.Unit) : '');
+    var logo = logoDataUrl();
+    return '<div class="pf">' +
+      '<div class="pf-head">' + (logo ? '<img src="' + logo + '" alt="">' : '') + '<div><h1>Coaching Record' + (s.Status !== 'Completed' ? '<span class="pf-draft">' + esc(s.Status.toUpperCase()) + '</span>' : '') + '</h1><div class="pf-org">Alliance Global Solutions</div></div>' +
+      '<div class="pf-meta"><b>' + esc(s.CoachingID) + '</b><br>Printed ' + esc(fmtDate(todayTz())) + '</div></div>' +
+      '<div class="pf-grid">' + f('Agent', esc(a.FullName || s.AgentID) + (a.EmployeeID ? ' <span style="color:#555">(' + esc(a.EmployeeID) + ')</span>' : '')) + f('Campaign', esc(campName(s.CampaignID))) + f('Team lead', esc(tlName(s.TeamLeadID))) +
+      f('Coaching date', esc(fmtDate(s.CoachingDate))) + f('Category', esc(s.Category)) + f('Coaching method', esc(s.CoachingMethod)) + '</div>' +
+      '<h2>Performance gap</h2>' + gap +
+      '<h2>Root cause</h2><div class="pf-checks">' + (rc.length ? rc.map(function (r) { return '<span>☑ ' + esc(r) + '</span>'; }).join('') : '—') + '</div>' + (s.RootCauseNotes ? '<div style="margin-top:3px">' + L(s.RootCauseNotes) + '</div>' : '') +
+      '<h2>Discussion</h2><div class="pf-grid two">' + f('What was discussed and agreed', L(s.DiscussionSummary), 'pf-wide') + f('Agent\'s response', L(s.AgentFeedback), 'pf-wide') + '</div>' +
+      '<h2>Action plan</h2>' + (shown.length ? '<table><thead><tr><th style="width:4%">#</th><th>Action the agent will take</th><th style="width:20%">Deadline</th></tr></thead><tbody>' +
+        shown.map(function (it, i) { return '<tr><td>' + (i + 1) + '</td><td>' + L(it.Description) + '</td><td>' + esc(it.Deadline ? fmtDate(it.Deadline) : '—') + '</td></tr>'; }).join('') + '</tbody></table>' +
+        (items.length > shown.length ? '<div class="pf-more">and ' + (items.length - shown.length) + ' more action(s) in the app, record ' + esc(s.CoachingID) + '</div>' : '') : '<div>—</div>') +
+      '<div class="pf-grid two" style="margin-top:5px">' + f('Follow-up date', esc(plan && plan.FollowUpDate ? fmtDate(plan.FollowUpDate) : '')) + f('Target to reach', esc(target)) + '</div>' +
+      '<div class="pf-sign">' + [['Agent', a.FullName || ''], ['Team lead', tlName(s.TeamLeadID)]].map(function (p) {
+        return '<div><div class="row"><div><div class="line"></div><div class="lbl">' + esc(p[0]) + ' signature</div></div><div><div class="line"></div><div class="lbl">Date</div></div></div><div style="margin-top:4px;font-size:9pt">' + esc(p[1]) + '</div></div>';
+      }).join('') + '</div>' +
+      '<div class="pf-foot"><span>Confidential — employee performance record</span><span>AGS Coaching Hub, ' + esc(s.CoachingID) + '</span></div></div>';
+  }
+  // Builds the form, then shrinks it (and, only if needed, shortens long text) so it fits one A4 page.
+  function preparePrint(id) {
+    var s = findSession(id); if (!s) return null;
+    var root = $('#print-root'); if (!root) { root = document.createElement('div'); root.id = 'print-root'; document.body.appendChild(root); }
+    root.className = 'measure';
+    var maxPx = PRINT_MAX_MM * PX_PER_MM, limits = [100000, 1500, 1000, 700, 450, 300], chosen = null;
+    for (var i = 0; i < limits.length; i++) {
+      root.innerHTML = printFormHtml(s, limits[i]);
+      var h = root.firstChild.offsetHeight, zoom = Math.min(1, maxPx / h);
+      chosen = { zoom: zoom, limit: limits[i] };
+      if (zoom >= PRINT_MIN_ZOOM) break;
+    }
+    root.firstChild.style.zoom = Math.max(chosen.zoom, PRINT_MIN_ZOOM * 0.9).toFixed(3);
+    root.className = '';
+    document.documentElement.classList.add('printing-form');
+    return chosen;
+  }
+  function cleanupPrint() { document.documentElement.classList.remove('printing-form'); var r = $('#print-root'); if (r) r.innerHTML = ''; }
+  window.addEventListener('afterprint', cleanupPrint);
+  window.__AGS_preparePrint = preparePrint;   // used by automated tests
+  ACT.printRecord = function (el) { preparePrint(el.dataset.id); setTimeout(function () { window.print(); setTimeout(cleanupPrint, 500); }, 50); };
+
   function reopenSession(id) { if (modalStack.length) closeModal(true); render(); openSession(id); }
   ACT.loadHistory = function (el) {
     var box = document.getElementById('hist-' + el.dataset.id); box.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
